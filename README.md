@@ -12,10 +12,11 @@ The tab files come from [classtab.org](https://www.classtab.org), a long-running
 
 1. Go to **https://www.classtab.org** and download the full zip archive (linked on the homepage as something like *"Download all files"*).
 2. Unzip the archive. It will contain a large collection of `.txt` and `.mid` files.
-3. Place the unzipped contents into a folder called **`tab/`** at the root of this repository:
+3. The `tab/` folder already exists in the repository (it contains a `.gitkeep` placeholder). Place the unzipped files directly into it:
 
 ```
-tab/           ← create this folder and put the files here
+tab/           ← already exists; drop the files in here
+├── .gitkeep   ← placeholder, keep this
 ├── lauro_two_venezuelan_waltzes_1_el_negrito.txt
 ├── lauro_two_venezuelan_waltzes_1_el_negrito.mid
 ├── villa-lobos_choros_01.txt
@@ -23,7 +24,7 @@ tab/           ← create this folder and put the files here
 └── … (~2 300 pairs)
 ```
 
-The `tab/` folder is listed in `.gitignore` and will not be committed.
+The contents of `tab/` are listed in `.gitignore` and will not be committed.
 
 ---
 
@@ -31,7 +32,7 @@ The `tab/` folder is listed in `.gitignore` and will not be committed.
 
 ```
 tab/                    ← root of the repo (same name as the source folder)
-├── tab/                Source files — .txt and .mid pairs (git-ignored)
+├── tab/                Source files — .txt and .mid pairs (contents git-ignored)
 ├── pipeline/           Processing code
 │   ├── models.py           Shared data classes (NoteEvent, MeasureData, …)
 │   ├── topmatter_parser.py Header parsing: tuning, title, composer, transcriber, chords
