@@ -1,0 +1,1221 @@
+"""
+test_parsers.py
+===============
+Unit tests for the refactored classtab parser modules:
+  • topmatter_parser  (find_tuning, find_composer_author_title,
+                       find_transcriber, find_chords_fingering, parse_topmatter)
+  • tab_parser        (find_systems, content_start, bar_positions,
+                       measure_cells, extract_notes, parse_barres,
+                       assign_lh_fingering, assign_rh_fingering,
+                       detect_repeat_volta, parse_tab)
+  • bottom_parser     (find_notes_legend, find_dynamics,
+                       find_biographical, parse_bottom)
+  • parse_txt.parse   (integration: TabFile round-trip on real files)
+
+Run:
+    python pipeline/test_parsers.py
+or (from the pipeline/ dir):
+    python test_parsers.py
+"""
+
+from __future__ import annotations
+import sys, os, unittest
+from pathlib import Path
+
+HERE  = Path(__file__).parent
+ROOT  = HERE.parent
+CLASSTAB = ROOT / 'tab'
+sys.path.insert(0, str(HERE))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load(filename: str) -> list[str]:
+    """Load a tab file as a list of stripped lines."""
+    path = CLASSTAB / filename
+    with open(path, encoding='utf-8', errors='replace') as f:
+        return [l.rstrip() for l in f]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# topmatter_parser tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFindTuning(unittest.TestCase):
+
+    def test_standard_tuning_default(self):
+        """Files with no tuning statement return EADGBE."""
+        from topmatter_parser import find_tuning
+        lines = ["El Negrito - Antonio Lauro", "Key C", "Time 3/4"]
+        self.assertEqual(find_tuning(lines), "EADGBE")
+
+    def test_explicit_tuning_colon(self):
+        from topmatter_parser import find_tuning
+        lines = ["Tuning: D A D G B E", "some other line"]
+        self.assertEqual(find_tuning(lines), "DADGBE")
+
+    def test_explicit_tuning_no_spaces(self):
+        from topmatter_parser import find_tuning
+        lines = ["tuning: DADGBE", "Key D"]
+        self.assertEqual(find_tuning(lines), "DADGBE")
+
+    def test_drop_d(self):
+        from topmatter_parser import find_tuning
+        lines = ["Some Piece", "Drop D tuning", "Key D"]
+        self.assertEqual(find_tuning(lines), "DADGBE")
+
+    def test_tune_sixth_to_d(self):
+        from topmatter_parser import find_tuning
+        lines = ["Preludes", "Tune the 6th string to D", "Key G"]
+        result = find_tuning(lines)
+        self.assertTrue(result.endswith('D'), f"Expected 6th string (last char) = D, got {result}")
+
+    def test_tune_first_string(self):
+        from topmatter_parser import find_tuning
+        lines = ["Some Piece", "Tune the 1st string to D"]
+        result = find_tuning(lines)
+        self.assertEqual(result[0], 'D')
+
+    def test_real_file_standard_tuning(self):
+        from topmatter_parser import find_tuning
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        self.assertEqual(find_tuning(lines), "EADGBE")
+
+    def test_dadgad(self):
+        from topmatter_parser import find_tuning
+        lines = ["Celtic piece", "DADGAD tuning"]
+        self.assertEqual(find_tuning(lines), "DADGAD")
+
+
+class TestFindComposerAuthorTitle(unittest.TestCase):
+
+    def test_title_dash_composer_dates(self):
+        from topmatter_parser import find_composer_author_title
+        lines = ["El Negrito - Antonio Lauro (1917-1986)", ""]
+        r = find_composer_author_title(lines)
+        self.assertEqual(r['title'], "El Negrito")
+        self.assertEqual(r['composer'], "Antonio Lauro")
+        self.assertEqual(r['composer_dates'], "1917-1986")
+
+    def test_title_dash_composer_no_dates(self):
+        from topmatter_parser import find_composer_author_title
+        lines = ["Romance - Anonymous", ""]
+        r = find_composer_author_title(lines)
+        self.assertEqual(r['title'], "Romance")
+        self.assertEqual(r['composer'], "Anonymous")
+
+    def test_author_label(self):
+        from topmatter_parser import find_composer_author_title
+        lines = ["Some Piece", "Author: Fernando Sor", ""]
+        r = find_composer_author_title(lines)
+        self.assertIn("Sor", r['composer'])
+
+    def test_by_label(self):
+        from topmatter_parser import find_composer_author_title
+        lines = ["Étude", "By: Leo Brouwer", ""]
+        r = find_composer_author_title(lines)
+        self.assertIn("Brouwer", r['composer'])
+
+    def test_real_file_lauro(self):
+        from topmatter_parser import find_composer_author_title
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        r = find_composer_author_title(lines)
+        self.assertIn("Lauro", r['composer'])
+        self.assertIn("Negrito", r['title'])
+
+    def test_real_file_villa_lobos(self):
+        from topmatter_parser import find_composer_author_title
+        lines = _load('villa-lobos_choros_01.txt')
+        r = find_composer_author_title(lines)
+        self.assertTrue(r['title'])  # should find a title
+
+    def test_spaced_composer(self):
+        """Title     Composer with 4+ spaces."""
+        from topmatter_parser import find_composer_author_title
+        lines = ["Cancion          Antonio Lauro", ""]
+        r = find_composer_author_title(lines)
+        self.assertIn("Cancion", r['title'])
+        self.assertIn("Lauro", r['composer'])
+
+
+class TestFindTranscriber(unittest.TestCase):
+
+    def test_tabbed_by(self):
+        from topmatter_parser import find_transcriber
+        lines = ["El Negrito - Antonio Lauro", "",
+                 "tabbed by Weed - August 98 - weed@wussu.com"]
+        self.assertEqual(find_transcriber(lines), "Weed")
+
+    def test_transcribed_by(self):
+        from topmatter_parser import find_transcriber
+        lines = ["Romance", "transcribed by John Smith", ""]
+        self.assertIn("John Smith", find_transcriber(lines))
+
+    def test_arranged_by(self):
+        from topmatter_parser import find_transcriber
+        lines = ["Piece", "arranged by Mary Jones", ""]
+        self.assertIn("Mary Jones", find_transcriber(lines))
+
+    def test_no_transcriber(self):
+        from topmatter_parser import find_transcriber
+        lines = ["Romance - Anonymous", "Key Am", "Time 3/4"]
+        self.assertEqual(find_transcriber(lines), "")
+
+    def test_real_file_has_transcriber(self):
+        from topmatter_parser import find_transcriber
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        t = find_transcriber(lines)
+        self.assertNotEqual(t, "")  # this file says "tabbed by Weed"
+
+
+class TestFindChordsFingeringEmpty(unittest.TestCase):
+
+    def test_no_chords_returns_empty(self):
+        from topmatter_parser import find_chords_fingering
+        lines = ["El Negrito - Antonio Lauro", "Key C", "Time 3/4"]
+        self.assertEqual(find_chords_fingering(lines), [])
+
+    def test_chord_diagram(self):
+        """Synthetic chord box detection."""
+        from topmatter_parser import find_chords_fingering
+        lines = [
+            "Am:",
+            "x02210",
+            "231",
+        ]
+        # Our detector requires 4+ string lines; this has only 1 → no match
+        self.assertEqual(find_chords_fingering(lines), [])
+
+
+class TestParseTopmatter(unittest.TestCase):
+
+    def test_returns_all_keys(self):
+        from topmatter_parser import parse_topmatter
+        lines = ["El Negrito - Antonio Lauro (1917-1986)", "Key C", "Time 3/4", "Tempo 120 bpm"]
+        r = parse_topmatter(lines)
+        for key in ('title', 'composer', 'composer_dates', 'transcriber',
+                    'tuning', 'key', 'time_sig', 'tempo', 'tempo_unit', 'capo', 'chords'):
+            self.assertIn(key, r, f"Missing key: {key}")
+
+    def test_key_time_tempo(self):
+        from topmatter_parser import parse_topmatter
+        lines = [
+            "El Negrito - Antonio Lauro (1917-1986)",
+            "Key C",
+            "Time 3/4",
+            "Tempo 120 bpm",
+        ]
+        r = parse_topmatter(lines)
+        self.assertEqual(r['key'], 'C')
+        self.assertEqual(r['time_sig'], '3/4')
+        self.assertEqual(r['tempo'], 120)
+
+    def test_capo(self):
+        from topmatter_parser import parse_topmatter
+        lines = ["My Piece - Composer", "Capo 2"]
+        r = parse_topmatter(lines)
+        self.assertEqual(r['capo'], 2)
+
+    def test_real_file(self):
+        from topmatter_parser import parse_topmatter
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        r = parse_topmatter(lines)
+        self.assertIn("Lauro", r['composer'])
+        self.assertEqual(r['tuning'], "EADGBE")
+        self.assertEqual(r['time_sig'], "3/4")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# tab_parser tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTuningHelpers(unittest.TestCase):
+
+    def test_tuning_to_midi_standard(self):
+        from tab_parser import tuning_to_midi
+        midi = tuning_to_midi("EADGBE")
+        self.assertEqual(len(midi), 6)
+        # String 1 (high e) = E4 = MIDI 64
+        self.assertEqual(midi[0], 64)
+        # String 6 (low E) = E2 = MIDI 40
+        self.assertEqual(midi[5], 40)
+
+    def test_tuning_to_midi_drop_d(self):
+        from tab_parser import tuning_to_midi
+        midi = tuning_to_midi("DADGBE")
+        # String 6 (low) should now be D2 = MIDI 38
+        self.assertEqual(midi[5], 38)
+
+    def test_note_midi_standard(self):
+        from tab_parser import tuning_to_midi, note_midi
+        midi = tuning_to_midi("EADGBE")
+        # String 1 open = E4 = 64
+        self.assertEqual(note_midi(1, 0, midi), 64)
+        # String 1 fret 5 = A4 = 69
+        self.assertEqual(note_midi(1, 5, midi), 69)
+        # String 6 open = E2 = 40
+        self.assertEqual(note_midi(6, 0, midi), 40)
+
+    def test_tuning_open_notes_standard(self):
+        from tab_parser import tuning_open_notes
+        names = tuning_open_notes("EADGBE")
+        self.assertEqual(names[0], "E4")   # string 1
+        self.assertEqual(names[5], "E2")   # string 6
+
+    def test_tuning_open_notes_drop_d(self):
+        from tab_parser import tuning_open_notes
+        names = tuning_open_notes("DADGBE")
+        self.assertEqual(names[5], "D2")   # string 6 = D
+
+
+class TestContentStart(unittest.TestCase):
+
+    def test_format_a_pipe(self):
+        from tab_parser import content_start
+        self.assertEqual(content_start("E|----0-1-"), 2)
+
+    def test_format_a_colon(self):
+        from tab_parser import content_start
+        self.assertEqual(content_start("E:----0-1-"), 2)
+
+    def test_format_b_dashes(self):
+        from tab_parser import content_start
+        # letter then dashes: content starts right after the letter
+        result = content_start("E----0-1-")
+        self.assertGreaterEqual(result, 1)
+
+    def test_format_c_double_pipe(self):
+        from tab_parser import content_start
+        self.assertEqual(content_start("||----0-1-"), 2)
+
+    def test_format_d_single_pipe(self):
+        from tab_parser import content_start
+        self.assertEqual(content_start("|----0-1-"), 1)
+
+    def test_format_e_plain(self):
+        from tab_parser import content_start
+        self.assertEqual(content_start("----0-1-"), 0)
+
+
+class TestBarPositions(unittest.TestCase):
+
+    def test_no_bars(self):
+        from tab_parser import bar_positions
+        lines = ["E|----0-1-2-", "B|----------", "G|----------",
+                 "D|----------", "A|----------", "E|----------"]
+        pos = bar_positions(lines)
+        self.assertEqual(pos, [])
+
+    def test_single_bar(self):
+        from tab_parser import bar_positions
+        lines = ["E|----0---|----1-",
+                 "B|--------|------",
+                 "G|--------|------",
+                 "D|--------|------",
+                 "A|--------|------",
+                 "E|--------|------"]
+        pos = bar_positions(lines)
+        self.assertEqual(len(pos), 1)
+
+    def test_multiple_bars(self):
+        from tab_parser import bar_positions
+        lines = ["E|--0--|--1--|--2-",
+                 "B|-----|-----|----",
+                 "G|-----|-----|----",
+                 "D|-----|-----|----",
+                 "A|-----|-----|----",
+                 "E|-----|-----|----"]
+        pos = bar_positions(lines)
+        self.assertEqual(len(pos), 2)
+
+
+class TestMeasureCells(unittest.TestCase):
+
+    def test_two_cells(self):
+        from tab_parser import measure_cells, bar_positions
+        lines = ["E|--0--|--1-",
+                 "B|-----|----",
+                 "G|-----|----",
+                 "D|-----|----",
+                 "A|-----|----",
+                 "E|-----|----"]
+        bars = bar_positions(lines)
+        cells = measure_cells(lines, bars)
+        self.assertEqual(len(cells), 2)
+
+    def test_cell_boundaries_non_overlapping(self):
+        from tab_parser import measure_cells, bar_positions
+        lines = ["E|--0--|--1--|--2-",
+                 "B|-----|-----|----",
+                 "G|-----|-----|----",
+                 "D|-----|-----|----",
+                 "A|-----|-----|----",
+                 "E|-----|-----|----"]
+        bars  = bar_positions(lines)
+        cells = measure_cells(lines, bars)
+        for i in range(len(cells) - 1):
+            # Each cell starts after the previous ends
+            self.assertGreaterEqual(cells[i + 1][0], cells[i][1])
+
+
+class TestExtractNotes(unittest.TestCase):
+
+    def _midi(self):
+        from tab_parser import tuning_to_midi
+        return tuning_to_midi("EADGBE")
+
+    def test_single_note(self):
+        from tab_parser import extract_notes
+        tuning = self._midi()
+        notes = extract_notes("--5--", 1, 0, "E4", tuning)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].fret, 5)
+        self.assertEqual(notes[0].string, 1)
+
+    def test_two_notes(self):
+        from tab_parser import extract_notes
+        tuning = self._midi()
+        notes = extract_notes("--5--3-", 1, 0, "E4", tuning)
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0].fret, 5)
+        self.assertEqual(notes[1].fret, 3)
+
+    def test_harmonic(self):
+        from tab_parser import extract_notes
+        tuning = self._midi()
+        notes = extract_notes("--<7>--", 1, 0, "E4", tuning)
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].harmonic)
+        self.assertEqual(notes[0].fret, 7)
+
+    def test_two_digit_fret(self):
+        from tab_parser import extract_notes
+        tuning = self._midi()
+        notes = extract_notes("--12--", 1, 0, "E4", tuning)
+        self.assertEqual(notes[0].fret, 12)
+
+    def test_technique_hammer(self):
+        from tab_parser import extract_notes
+        tuning = self._midi()
+        notes = extract_notes("--5h7-", 1, 0, "E4", tuning)
+        self.assertEqual(notes[0].technique, "hammer")
+
+    def test_technique_slide(self):
+        from tab_parser import extract_notes
+        tuning = self._midi()
+        notes = extract_notes("--5/7-", 1, 0, "E4", tuning)
+        self.assertEqual(notes[0].technique, "slide_up")
+
+    def test_midi_pitch_computed(self):
+        """open note on string 1 (E4) = MIDI 64; fret 5 = MIDI 69."""
+        from tab_parser import extract_notes, tuning_to_midi
+        tuning = tuning_to_midi("EADGBE")
+        notes = extract_notes("--5--", 1, 0, "E4", tuning)
+        self.assertEqual(notes[0].midi_pitch, 69)  # E4 + 5 = A4
+
+    def test_open_note_stored(self):
+        from tab_parser import extract_notes, tuning_to_midi
+        tuning = tuning_to_midi("EADGBE")
+        notes = extract_notes("--0--", 1, 0, "E4", tuning)
+        self.assertEqual(notes[0].open_note, "E4")
+
+    def test_drop_d_midi(self):
+        """String 6 open in Drop D = D2 = MIDI 38."""
+        from tab_parser import extract_notes, tuning_to_midi
+        tuning = tuning_to_midi("DADGBE")
+        notes = extract_notes("--0--", 6, 0, "D2", tuning)
+        self.assertEqual(notes[0].midi_pitch, 38)
+
+
+class TestParseBarres(unittest.TestCase):
+
+    def test_roman_barre(self):
+        from tab_parser import parse_barres
+        markers = parse_barres("CII              ", 0, 50)
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0].fret, 2)
+        self.assertFalse(markers[0].partial)
+
+    def test_partial_barre(self):
+        from tab_parser import parse_barres
+        markers = parse_barres("cIV              ", 0, 50)
+        self.assertEqual(markers[0].fret, 4)
+        self.assertTrue(markers[0].partial)
+
+    def test_arabic_barre(self):
+        from tab_parser import parse_barres
+        markers = parse_barres("C5               ", 0, 50)
+        self.assertEqual(markers[0].fret, 5)
+
+    def test_out_of_range_ignored(self):
+        from tab_parser import parse_barres
+        # barre at col 30-35 but our window is 0-10
+        markers = parse_barres("               CII  ", 0, 10)
+        self.assertEqual(len(markers), 0)
+
+
+class TestAssignLhFingering(unittest.TestCase):
+
+    def test_assigns_nearest_finger(self):
+        from tab_parser import assign_lh_fingering
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=5, col=5)]
+        finger_lines = ["     2    "]   # digit '2' at col 5
+        assign_lh_fingering(notes, finger_lines)
+        self.assertEqual(notes[0].finger, 2)
+
+    def test_no_finger_lines(self):
+        from tab_parser import assign_lh_fingering
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=5, col=5)]
+        assign_lh_fingering(notes, [])
+        self.assertIsNone(notes[0].finger)
+
+    def test_multiple_notes(self):
+        from tab_parser import assign_lh_fingering
+        from models import NoteEvent
+        notes = [
+            NoteEvent(string=1, fret=5, col=3),
+            NoteEvent(string=2, fret=5, col=7),
+        ]
+        assign_lh_fingering(notes, ["   1   3   "])
+        self.assertEqual(notes[0].finger, 1)
+        self.assertEqual(notes[1].finger, 3)
+
+
+class TestAssignRhFingering(unittest.TestCase):
+
+    def test_pima_assigns(self):
+        from tab_parser import assign_rh_fingering
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=0, col=3)]
+        assign_rh_fingering(notes, "   p    ")
+        self.assertEqual(notes[0].rh_finger, "p")
+
+    def test_no_pima(self):
+        from tab_parser import assign_rh_fingering
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=0, col=3)]
+        assign_rh_fingering(notes, None)
+        self.assertIsNone(notes[0].rh_finger)
+
+    def test_ima_assignment(self):
+        from tab_parser import assign_rh_fingering
+        from models import NoteEvent
+        notes = [
+            NoteEvent(string=1, fret=0, col=2),
+            NoteEvent(string=2, fret=0, col=5),
+            NoteEvent(string=3, fret=0, col=8),
+        ]
+        assign_rh_fingering(notes, "  i  m  a")
+        self.assertEqual(notes[0].rh_finger, "i")
+        self.assertEqual(notes[1].rh_finger, "m")
+        self.assertEqual(notes[2].rh_finger, "a")
+
+
+class TestDetectRepeatVolta(unittest.TestCase):
+
+    def test_repeat_start(self):
+        from tab_parser import detect_repeat_volta
+        lines = [
+            "*|----0-",
+            "*|------",
+            "*|------",
+            "*|------",
+            "*|------",
+            "*|------",
+        ]
+        rs, re_, volta = detect_repeat_volta(lines, 0, 10, None)
+        self.assertTrue(rs)
+        self.assertFalse(re_)
+
+    def test_repeat_end(self):
+        from tab_parser import detect_repeat_volta
+        lines = [
+            "----0-*|",
+            "-------*|",
+            "-------*|",
+            "-------*|",
+            "-------*|",
+            "-------*|",
+        ]
+        rs, re_, volta = detect_repeat_volta(lines, 0, len(lines[0]), None)
+        self.assertTrue(re_)
+
+    def test_no_repeat(self):
+        from tab_parser import detect_repeat_volta
+        lines = ["----0-1-"] * 6
+        rs, re_, volta = detect_repeat_volta(lines, 0, 10, None)
+        self.assertFalse(rs)
+        self.assertFalse(re_)
+        self.assertIsNone(volta)
+
+
+class TestFindSystems(unittest.TestCase):
+
+    def test_finds_systems_in_real_file(self):
+        from tab_parser import find_systems
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        systems = find_systems(lines)
+        self.assertGreater(len(systems), 0)
+        for sys in systems:
+            self.assertIn('string_idxs', sys)
+            self.assertEqual(len(sys['string_idxs']), 6)
+
+    def test_villa_lobos_pipe_format(self):
+        from tab_parser import find_systems
+        lines = _load('villa-lobos_choros_01.txt')
+        systems = find_systems(lines)
+        self.assertGreater(len(systems), 10)
+
+
+class TestParseTab(unittest.TestCase):
+
+    def test_returns_measures_dict(self):
+        from tab_parser import parse_tab
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        measures = parse_tab(lines, "EADGBE")
+        self.assertIsInstance(measures, dict)
+        self.assertGreater(len(measures), 0)
+
+    def test_notes_have_midi_pitch(self):
+        from tab_parser import parse_tab
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        measures = parse_tab(lines, "EADGBE")
+        for md in measures.values():
+            for note in md.notes:
+                self.assertGreater(note.midi_pitch, 0,
+                    f"Expected positive MIDI pitch for s{note.string}f{note.fret}")
+
+    def test_notes_have_open_note(self):
+        from tab_parser import parse_tab
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        measures = parse_tab(lines, "EADGBE")
+        for md in measures.values():
+            for note in md.notes:
+                self.assertTrue(note.open_note,
+                    f"Expected open_note to be set for s{note.string}f{note.fret}")
+
+    def test_drop_d_string6_midi(self):
+        """With Drop D tuning, open string 6 should be MIDI 38 (D2)."""
+        from tab_parser import parse_tab
+        # Synthesize a minimal 6-line tab with an open string 6 note
+        lines = [
+            "My Piece",
+            "0   |",
+            "E|------|",
+            "B|------|",
+            "G|------|",
+            "D|------|",
+            "A|------|",
+            "E|--0---|",
+        ]
+        measures = parse_tab(lines, "DADGBE")
+        all_notes = [n for md in measures.values() for n in md.notes if n.string == 6]
+        if all_notes:  # only check if we found string-6 notes
+            self.assertEqual(all_notes[0].midi_pitch, 38)
+
+    def test_villa_lobos_measure_count(self):
+        from tab_parser import parse_tab
+        lines = _load('villa-lobos_choros_01.txt')
+        measures = parse_tab(lines, "EADGBE")
+        self.assertGreater(len(measures), 50)
+
+    def test_repeat_detection(self):
+        from tab_parser import parse_tab
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        measures = parse_tab(lines, "EADGBE")
+        starts = sum(1 for md in measures.values() if md.repeat_start)
+        ends   = sum(1 for md in measures.values() if md.repeat_end)
+        self.assertGreater(starts + ends, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# bottom_parser tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFindNotesLegend(unittest.TestCase):
+
+    def test_finds_notes_section(self):
+        from bottom_parser import find_notes_legend
+        lines = [
+            "Some Piece - Composer",
+            "E|----0-1-|",
+            "B|--------|",
+            "G|--------|",
+            "D|--------|",
+            "A|--------|",
+            "E|--------|",
+            "",
+            "Notes and Legend",
+            "0 = open string",
+            "h = hammer-on",
+        ]
+        result = find_notes_legend(lines)
+        self.assertIn("Legend", result)
+        self.assertIn("open string", result)
+
+    def test_returns_empty_if_not_found(self):
+        from bottom_parser import find_notes_legend
+        lines = ["A piece", "E|----0-|", "B|------|",
+                 "G|------|", "D|------|", "A|------|", "E|------|"]
+        result = find_notes_legend(lines)
+        self.assertEqual(result, "")
+
+    def test_real_file_lauro(self):
+        from bottom_parser import find_notes_legend
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        result = find_notes_legend(lines)
+        # El Negrito has "tablature explanation at the end"
+        # The actual legend section might or might not be there
+        self.assertIsInstance(result, str)
+
+
+class TestFindDynamics(unittest.TestCase):
+
+    def test_finds_dynamics_in_text(self):
+        from bottom_parser import find_dynamics
+        lines = [
+            "Play this section mf and gradually crescendo to f",
+            "The ending should be pp",
+        ]
+        result = find_dynamics(lines)
+        self.assertIsInstance(result, list)
+        found = set(result)
+        self.assertTrue(found & {'mf', 'f', 'pp', 'crescendo'},
+                        f"Expected some dynamics, got {result}")
+
+    def test_no_dynamics(self):
+        from bottom_parser import find_dynamics
+        lines = ["Just a title", "Key C", "Time 4/4"]
+        result = find_dynamics(lines)
+        self.assertIsInstance(result, list)
+
+    def test_dynamics_deduped(self):
+        from bottom_parser import find_dynamics
+        lines = ["Play mf, then mf again, then f"]
+        result = find_dynamics(lines)
+        self.assertEqual(result.count('mf'), 1)
+
+
+class TestFindBiographical(unittest.TestCase):
+
+    def test_finds_about_section(self):
+        from bottom_parser import find_biographical
+        lines = [
+            "Piece - Composer",
+            "E|----0-|", "B|------|", "G|------|",
+            "D|------|", "A|------|", "E|------|",
+            "",
+            "About the Composer",
+            "Antonio Lauro was born in 1917 in Venezuela. He was one of the",
+            "most important guitar composers of the 20th century.",
+        ]
+        result = find_biographical(lines)
+        self.assertIn("Lauro", result)
+
+    def test_returns_empty_if_none(self):
+        from bottom_parser import find_biographical
+        lines = ["Title - Composer", "Key C", "Time 4/4"]
+        result = find_biographical(lines)
+        self.assertIsInstance(result, str)
+
+    def test_heuristic_bio_detection(self):
+        """A paragraph with a year (1800s-1900s) and >60 chars should be detected."""
+        from bottom_parser import find_biographical
+        lines = [
+            "E|--0--|", "B|-----|", "G|-----|",
+            "D|-----|", "A|-----|", "E|-----|",
+            "",
+            "Fernando Sor was born in Barcelona in 1778 and died in Paris in 1839.",
+            "He is considered one of the greatest guitarists and composers of his era.",
+        ]
+        result = find_biographical(lines)
+        self.assertIn("1778", result)
+
+
+class TestParseBottom(unittest.TestCase):
+
+    def test_returns_all_keys(self):
+        from bottom_parser import parse_bottom
+        lines = ["Title - Composer"]
+        result = parse_bottom(lines)
+        self.assertIn('notes_text', result)
+        self.assertIn('dynamics', result)
+        self.assertIn('biographical', result)
+
+    def test_real_file(self):
+        from bottom_parser import parse_bottom
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        result = parse_bottom(lines)
+        self.assertIsInstance(result['notes_text'], str)
+        self.assertIsInstance(result['dynamics'], list)
+        self.assertIsInstance(result['biographical'], str)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Beat-structure tests  (tab_parser.get_beats + annotate_xml._merge_parts)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGetBeats(unittest.TestCase):
+    """Unit tests for tab_parser.get_beats() with synthetic note lists."""
+
+    def test_single_note_is_one_beat(self):
+        from tab_parser import get_beats
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=3, col=10)]
+        beats = get_beats(notes)
+        self.assertEqual(len(beats), 1)
+        self.assertEqual(len(beats[0]), 1)
+
+    def test_two_notes_same_col_one_beat(self):
+        from tab_parser import get_beats
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=3, col=10),
+                 NoteEvent(string=5, fret=2, col=10)]
+        beats = get_beats(notes)
+        self.assertEqual(len(beats), 1)
+        self.assertEqual(len(beats[0]), 2)
+
+    def test_two_notes_different_col_two_beats(self):
+        from tab_parser import get_beats
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=3, col=10),
+                 NoteEvent(string=4, fret=0, col=12)]
+        beats = get_beats(notes)
+        self.assertEqual(len(beats), 2)
+        self.assertEqual(beats[0][0].fret, 3)
+        self.assertEqual(beats[1][0].fret, 0)
+
+    def test_beat_order_is_ascending_col(self):
+        from tab_parser import get_beats
+        from models import NoteEvent
+        notes = [NoteEvent(string=1, fret=0, col=20),
+                 NoteEvent(string=3, fret=0, col=16),
+                 NoteEvent(string=2, fret=3, col=18)]
+        beats = get_beats(notes)
+        cols = [b[0].col for b in beats]
+        self.assertEqual(cols, [16, 18, 20])
+
+    def test_within_beat_sorted_by_string(self):
+        from tab_parser import get_beats
+        from models import NoteEvent
+        notes = [NoteEvent(string=5, fret=2, col=10),
+                 NoteEvent(string=1, fret=3, col=10),
+                 NoteEvent(string=3, fret=0, col=10)]
+        beats = get_beats(notes)
+        self.assertEqual(len(beats), 1)
+        strings = [n.string for n in beats[0]]
+        self.assertEqual(strings, [1, 3, 5])
+
+    def test_empty_returns_empty(self):
+        from tab_parser import get_beats
+        self.assertEqual(get_beats([]), [])
+
+
+# ---------------------------------------------------------------------------
+# Reusable mixin: structural invariants that must hold for ANY piece
+# ---------------------------------------------------------------------------
+
+class BeatInvariantsMixin:
+    """
+    Structural invariants for get_beats() and _merge_parts that must hold
+    for any correctly parsed piece.
+
+    Concrete subclasses must set two class attributes before the tests run:
+
+        txt_stem : str        — filename stem (no .txt) in tab/
+        mid_stem : str | None — filename stem (no .mid) in tab/,
+                                or None to skip the XML invariant test
+
+    setUpClass loads the TabFile once and stores it in cls._tab.
+    """
+
+    txt_stem: str = ''
+    mid_stem: str | None = None
+    _tab = None
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def setUpClass(cls):
+        from parse_txt import parse
+        cls._tab = parse(str(CLASSTAB / (cls.txt_stem + '.txt')))
+
+    # ------------------------------------------------------------------
+    # Tab-level invariants (purely from the parsed tab, no MIDI needed)
+    # ------------------------------------------------------------------
+
+    def test_inv_beats_ascending_col(self):
+        """get_beats() returns beats in strictly ascending column order."""
+        from tab_parser import get_beats
+        for mnum, md in self._tab.measures.items():
+            beats = get_beats(md.notes)
+            if not beats:
+                continue
+            cols = [b[0].col for b in beats]
+            self.assertEqual(cols, sorted(cols),
+                f"Measure {mnum}: beat columns not ascending: {cols}")
+
+    def test_inv_notes_in_beat_share_col(self):
+        """Every note within a beat must have the same column value."""
+        from tab_parser import get_beats
+        for mnum, md in self._tab.measures.items():
+            for bi, beat in enumerate(get_beats(md.notes)):
+                cols = {n.col for n in beat}
+                self.assertEqual(len(cols), 1,
+                    f"Measure {mnum} beat {bi}: notes have mixed cols {cols}")
+
+    def test_inv_within_beat_strings_ascending(self):
+        """Within each beat, notes are sorted by ascending string number."""
+        from tab_parser import get_beats
+        for mnum, md in self._tab.measures.items():
+            for bi, beat in enumerate(get_beats(md.notes)):
+                strings = [n.string for n in beat]
+                self.assertEqual(strings, sorted(strings),
+                    f"Measure {mnum} beat {bi}: strings not sorted: {strings}")
+
+    def test_inv_no_empty_beats(self):
+        """get_beats() never returns an empty beat group."""
+        from tab_parser import get_beats
+        for mnum, md in self._tab.measures.items():
+            for bi, beat in enumerate(get_beats(md.notes)):
+                self.assertGreater(len(beat), 0,
+                    f"Measure {mnum}: empty beat at index {bi}")
+
+    def test_inv_all_notes_have_midi_pitch(self):
+        """Every parsed note must carry a positive MIDI pitch."""
+        for mnum, md in self._tab.measures.items():
+            for note in md.notes:
+                self.assertGreater(note.midi_pitch, 0,
+                    f"Measure {mnum} s{note.string}f{note.fret}: "
+                    f"midi_pitch={note.midi_pitch}")
+
+    def test_inv_all_notes_have_open_note(self):
+        """Every parsed note must carry an open-string note name."""
+        for mnum, md in self._tab.measures.items():
+            for note in md.notes:
+                self.assertTrue(note.open_note,
+                    f"Measure {mnum} s{note.string}f{note.fret}: open_note empty")
+
+    # ------------------------------------------------------------------
+    # XML-level invariant (requires a MIDI file; skipped if mid_stem=None)
+    # ------------------------------------------------------------------
+
+    def test_inv_xml_offsets_non_decreasing_after_merge(self):
+        """
+        After _merge_parts, non-chord note offsets within every measure
+        must be non-decreasing — no note can start before the previous one.
+        """
+        if not self.mid_stem:
+            self.skipTest("mid_stem not set — skipping XML invariant")
+        mid_path = CLASSTAB / (self.mid_stem + '.mid')
+        if not mid_path.exists():
+            self.skipTest(f"MIDI not found: {mid_path.name}")
+
+        import tempfile, os
+        import xml.etree.ElementTree as ET
+        from convert_mid import mid_to_musicxml
+        from annotate_xml import _merge_parts
+
+        tmp = tempfile.mktemp(suffix='.xml')
+        try:
+            mid_to_musicxml(str(mid_path), tmp)
+            root = ET.parse(tmp).getroot()
+            _merge_parts(root)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        for part in root.findall('part'):
+            for meas in part.findall('measure'):
+                mnum     = meas.get('number', '?')
+                prev_off = -1
+                offset   = 0
+                prev_dur = 0
+                for note in meas.findall('note'):
+                    is_chord = note.find('chord') is not None
+                    is_rest  = note.find('rest')  is not None
+                    dur = int(note.findtext('duration', '0'))
+                    if is_chord:
+                        note_off = offset - prev_dur
+                    else:
+                        note_off = offset
+                        prev_dur = dur
+                        offset  += dur
+                    if not is_chord and not is_rest:
+                        self.assertGreaterEqual(note_off, prev_off,
+                            f"Part beat regression in measure {mnum}: "
+                            f"offset {note_off} < previous {prev_off}")
+                        prev_off = note_off
+
+
+# ---------------------------------------------------------------------------
+# Piece-specific tests for El Negrito (exact bar-2 beat sequence)
+# ---------------------------------------------------------------------------
+
+class TestBeatStructureElNegrito(BeatInvariantsMixin, unittest.TestCase):
+    """
+    Inherits all BeatInvariantsMixin invariants AND adds El-Negrito-specific
+    checks for the exact note content of bar 2.
+
+    Tab bar 2 (first full bar, after the pickup):
+      beat 1  col~20 : s1f3 (G4)  s5f2 (B2)   ← simultaneous
+      beat 2  col~22 : s4f0 (D3)              ← alone
+      beat 3  col~24 : s3f0 (G3)              ← alone
+      beat 4  col~26 : s4f0 (D3)              ← alone
+      beat 5  col~28 : s2f3 (D4)              ← alone
+      beat 6  col~30 : s3f0 (G3)              ← alone
+    """
+
+    txt_stem = 'lauro_two_venezuelan_waltzes_1_el_negrito'
+    mid_stem = 'lauro_two_venezuelan_waltzes_1_el_negrito'
+
+    def test_tab_beat1_has_two_notes(self):
+        """Beat 1 of bar 2 must have exactly 2 simultaneous notes."""
+        from tab_parser import get_beats
+        md    = self._tab.measures[1]   # measure 1 = first full bar
+        beats = get_beats(md.notes)
+        self.assertGreaterEqual(len(beats), 1)
+        self.assertEqual(len(beats[0]), 2,
+            f"Expected 2 notes at beat 1, got {len(beats[0])}: "
+            f"{[f's{n.string}f{n.fret}' for n in beats[0]]}")
+
+    def test_tab_beat1_strings_and_frets(self):
+        """Beat 1 notes must be s1f3 (E-string fret-3) and s5f2 (A-string fret-2)."""
+        from tab_parser import get_beats
+        beats = get_beats(self._tab.measures[1].notes)
+        b1    = beats[0]
+        self.assertEqual(b1[0].string, 1); self.assertEqual(b1[0].fret, 3)
+        self.assertEqual(b1[1].string, 5); self.assertEqual(b1[1].fret, 2)
+
+    def test_tab_subsequent_beats_are_single_notes(self):
+        """Beats 2-6 of bar 2 must each be a single note (no spurious chords)."""
+        from tab_parser import get_beats
+        beats = get_beats(self._tab.measures[1].notes)
+        for i, beat in enumerate(beats[1:], start=2):
+            self.assertEqual(len(beat), 1,
+                f"Beat {i} should have 1 note, got {len(beat)}: "
+                f"{[f's{n.string}f{n.fret}' for n in beat]}")
+
+    def test_tab_beat_sequence(self):
+        """Full beat sequence of bar 2 must match the tab text exactly."""
+        from tab_parser import get_beats
+        beats = get_beats(self._tab.measures[1].notes)
+        expected = [
+            [(1, 3), (5, 2)],   # beat 1: chord  3XXX2X
+            [(4, 0)],            # beat 2:        XXX0XX
+            [(3, 0)],            # beat 3:        XX0XXX
+            [(4, 0)],            # beat 4:        XXX0XX
+            [(2, 3)],            # beat 5:        X3XXXX
+            [(3, 0)],            # beat 6:        XX0XXX
+        ]
+        self.assertEqual(len(beats), len(expected),
+            f"Expected {len(expected)} beats, got {len(beats)}")
+        for bi, (beat, exp) in enumerate(zip(beats, expected)):
+            actual = sorted((n.string, n.fret) for n in beat)
+            self.assertEqual(actual, sorted(exp),
+                f"Beat {bi+1}: expected {exp}, got {actual}")
+
+    def test_xml_bar2_exact_beat_sequence(self):
+        """
+        After _merge_parts, bar 2's XML must have exactly this offset/midi
+        sequence: G4+B2 chord at 0, then D3/G3/D3/D4/G3 sequentially.
+        """
+        import tempfile, os
+        import xml.etree.ElementTree as ET
+        from convert_mid import mid_to_musicxml
+        from annotate_xml import _merge_parts, _xml_note_midi
+
+        tmp = tempfile.mktemp(suffix='.xml')
+        try:
+            mid_to_musicxml(str(CLASSTAB / (self.mid_stem + '.mid')), tmp)
+            root = ET.parse(tmp).getroot()
+            _merge_parts(root)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        part  = root.findall('part')[0]
+        meas2 = part.findall('measure')[1]
+
+        notes_info = []
+        offset = 0; prev_dur = 0
+        for note in meas2.findall('note'):
+            is_chord = note.find('chord') is not None
+            is_rest  = note.find('rest')  is not None
+            dur = int(note.findtext('duration', '0'))
+            if is_chord:
+                note_offset = offset - prev_dur
+            else:
+                note_offset = offset; prev_dur = dur; offset += dur
+            if not is_rest:
+                notes_info.append((note_offset, _xml_note_midi(note), is_chord))
+
+        expected = [
+            (0,     67, False),   # G4  base
+            (0,     47, True),    # B2  chord
+            (5040,  50, False),   # D3
+            (10080, 55, False),   # G3
+            (15120, 50, False),   # D3
+            (20160, 62, False),   # D4
+            (25200, 55, False),   # G3
+        ]
+        self.assertEqual(notes_info, expected,
+            f"XML beat structure wrong.\nGot:      {notes_info}\nExpected: {expected}")
+
+
+# ---------------------------------------------------------------------------
+# Apply BeatInvariantsMixin to additional pieces
+# Each class exercises all 7 invariant tests on a different piece/MIDI combo.
+# ---------------------------------------------------------------------------
+
+class TestBeatInvariants_VillaLobos(BeatInvariantsMixin, unittest.TestCase):
+    """2-part MIDI, 43 systems, 135 measures."""
+    txt_stem = 'villa-lobos_choros_01'
+    mid_stem = 'villa-lobos_choros_01'
+
+
+class TestBeatInvariants_Cardoso(BeatInvariantsMixin, unittest.TestCase):
+    """3-part MIDI — exercises merging more than 2 parts."""
+    txt_stem = 'cardoso_suite_sudamericana_09_aire_de_milonga'
+    mid_stem = 'cardoso_suite_sudamericana_09_aire_de_milonga'
+
+
+class TestBeatInvariants_Barrios(BeatInvariantsMixin, unittest.TestCase):
+    """5-part MIDI — stresses the merge heavily."""
+    txt_stem = 'barrios_un_sueno_en_la_floresta'
+    mid_stem = 'barrios_un_sueno_en_la_floresta'
+
+
+class TestBeatInvariants_Bach(BeatInvariantsMixin, unittest.TestCase):
+    """Single-part MIDI — merge is a no-op; tests tab-only invariants."""
+    txt_stem = 'bach_js_bwv0147_10_jesu_joy_of_mans_desiring'
+    mid_stem = 'bach_js_bwv0147_10_jesu_joy_of_mans_desiring_1'
+
+
+class TestBeatInvariants_Albeniz(BeatInvariantsMixin, unittest.TestCase):
+    """4-part MIDI — another multi-part stress test."""
+    txt_stem = 'albeniz_isaac_op165_no2_tango_in_d'
+    mid_stem = 'albeniz_isaac_op165_no2_tango_in_d'
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Integration tests — parse_txt.parse
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestIntegration(unittest.TestCase):
+
+    def _parse(self, filename: str):
+        from parse_txt import parse
+        return parse(str(CLASSTAB / filename))
+
+    def test_lauro_el_negrito(self):
+        tab = self._parse('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        self.assertIn("Lauro", tab.metadata.composer)
+        self.assertIn("Negrito", tab.metadata.title)
+        self.assertEqual(tab.metadata.tuning, "EADGBE")
+        self.assertGreater(len(tab.measures), 30)
+        total_notes = sum(len(m.notes) for m in tab.measures.values())
+        self.assertGreater(total_notes, 100)
+
+    def test_villa_lobos_choros(self):
+        tab = self._parse('villa-lobos_choros_01.txt')
+        self.assertGreater(len(tab.measures), 50)
+
+    def test_bach_milonga(self):
+        tab = self._parse('cardoso_suite_sudamericana_09_aire_de_milonga.txt')
+        self.assertGreater(len(tab.measures), 0)
+
+    def test_metadata_has_transcriber(self):
+        tab = self._parse('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        self.assertNotEqual(tab.metadata.transcriber, "")
+
+    def test_all_notes_have_midi_pitch(self):
+        tab = self._parse('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        bad = [(n.string, n.fret) for md in tab.measures.values()
+               for n in md.notes if n.midi_pitch <= 0]
+        self.assertEqual(bad, [], f"Notes with missing MIDI pitch: {bad[:5]}")
+
+    def test_notes_have_open_note(self):
+        tab = self._parse('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        bad = [(n.string, n.fret) for md in tab.measures.values()
+               for n in md.notes if not n.open_note]
+        self.assertEqual(bad, [], f"Notes missing open_note: {bad[:5]}")
+
+    def test_backward_compat_find_systems(self):
+        """_find_systems imported from parse_txt should still work."""
+        from parse_txt import _find_systems
+        lines = _load('lauro_two_venezuelan_waltzes_1_el_negrito.txt')
+        systems = _find_systems(lines)
+        self.assertGreater(len(systems), 0)
+
+    def test_backward_compat_tuning_to_midi(self):
+        from parse_txt import tuning_to_midi
+        midi = tuning_to_midi("EADGBE")
+        self.assertEqual(midi[0], 64)
+
+    def test_backward_compat_note_midi(self):
+        from parse_txt import note_midi, tuning_to_midi
+        midi = tuning_to_midi("EADGBE")
+        self.assertEqual(note_midi(1, 0, midi), 64)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Runner
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    loader = unittest.TestLoader()
+    suite  = unittest.TestSuite()
+
+    for cls in [
+        # topmatter_parser
+        TestFindTuning,
+        TestFindComposerAuthorTitle,
+        TestFindTranscriber,
+        TestFindChordsFingeringEmpty,
+        TestParseTopmatter,
+        # tab_parser
+        TestTuningHelpers,
+        TestContentStart,
+        TestBarPositions,
+        TestMeasureCells,
+        TestExtractNotes,
+        TestParseBarres,
+        TestAssignLhFingering,
+        TestAssignRhFingering,
+        TestDetectRepeatVolta,
+        TestFindSystems,
+        TestParseTab,
+        # bottom_parser
+        TestFindNotesLegend,
+        TestFindDynamics,
+        TestFindBiographical,
+        TestParseBottom,
+        # Beat structure — unit tests
+        TestGetBeats,
+        # Beat structure — El Negrito specific (inherits invariants too)
+        TestBeatStructureElNegrito,
+        # Beat structure — general invariants across multiple pieces
+        TestBeatInvariants_VillaLobos,
+        TestBeatInvariants_Cardoso,
+        TestBeatInvariants_Barrios,
+        TestBeatInvariants_Bach,
+        TestBeatInvariants_Albeniz,
+        # Integration
+        TestIntegration,
+    ]:
+        suite.addTests(loader.loadTestsFromTestCase(cls))
+
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

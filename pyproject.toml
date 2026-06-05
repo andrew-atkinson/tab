@@ -1,0 +1,23 @@
+[project]
+name = "guitar-tab-pipeline"
+version = "0.1.0"
+description = "Classical guitar ASCII tab → annotated MusicXML pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "music21>=9.0",
+]
+
+[project.scripts]
+tab-pipeline = "pipeline.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["pipeline"]
+python_files = ["test_*.py"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pipeline*"]
+
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
