@@ -138,10 +138,21 @@ def _match_within_measure(
     Match *xml_notes* to *tab_notes* within a single measure using
     pitch proximity (±2 semitones) with a short lookahead.
 
+    Each tab_note tuple is:
+      (midi, string, fret, finger, tech, rh_finger, harmonic[, slide_dest_midi])
+
     The tab is canonical: when the MIDI has extra notes the algorithm
     skips them (they receive pitch-fallback annotation later).  When the
     tab has extra notes (e.g. a spurious slide target) the algorithm
     skips those tab notes so they cannot consume a real MIDI note.
+
+    Slide handling: a slide (e.g. 3/7) is one tab NoteEvent but the MIDI
+    typically records both the source pitch and the destination pitch as
+    separate note-on events.  After matching a slide note, the algorithm
+    looks at the immediately following XML note and consumes it silently if
+    its pitch matches the slide destination (±2 semitones).  This prevents
+    the orphaned destination note from being passed to the pitch-fallback
+    and rendered as a spurious extra note.
 
     Returns {local_xml_index: (string, fret, finger, tech, rh_finger, harmonic)}.
     """
@@ -150,15 +161,44 @@ def _match_within_measure(
     xi = 0
     ti = 0
 
+    def _consume_slide_dest(xi: int, tab_tup: tuple) -> int:
+        """
+        If *tab_tup* is a slide note and the XML note at *xi* matches the
+        slide's destination pitch, annotate that XML note with the slide's
+        destination fret and return xi+1.  Otherwise return xi unchanged.
+
+        This handles the common case where the MIDI encodes both the slide
+        source pitch and the slide destination pitch as separate note-on
+        events, while the tab represents the whole slide as a single
+        NoteEvent (with slide_to carrying the destination fret).
+        """
+        if tab_tup[4] not in ('slide_up', 'slide_down') or len(tab_tup) <= 8:
+            return xi
+        slide_dest_midi = tab_tup[7]
+        slide_dest_fret = tab_tup[8]
+        if slide_dest_midi is None or slide_dest_fret is None:
+            return xi
+        if xi >= len(xml_notes):
+            return xi
+        dest_xml_midi = _xml_note_midi(xml_notes[xi][1])
+        if abs(dest_xml_midi - slide_dest_midi) <= 2:
+            # Annotate the MIDI destination note with the slide's string + dest fret.
+            result[xi] = (tab_tup[1], slide_dest_fret, tab_tup[3],
+                          None, tab_tup[5], tab_tup[6])
+            return xi + 1
+        return xi
+
     while xi < len(xml_notes) and ti < len(tab_notes):
         _, xml_note = xml_notes[xi]
-        tab_midi, string, fret, finger, tech, rh_finger, harmonic = tab_notes[ti]
+        tab_tup  = tab_notes[ti]
+        tab_midi, string, fret, finger, tech, rh_finger, harmonic = tab_tup[:7]
         xml_midi = _xml_note_midi(xml_note)
 
         if abs(xml_midi - tab_midi) <= 2:
             result[xi] = (string, fret, finger, tech, rh_finger, harmonic)
             xi += 1
             ti += 1
+            xi = _consume_slide_dest(xi, tab_tup)
             continue
 
         # Try skipping XML notes (extra MIDI notes not in the tab)
@@ -171,6 +211,7 @@ def _match_within_measure(
                 result[xi + skip_x] = (string, fret, finger, tech, rh_finger, harmonic)
                 xi = xi + skip_x + 1
                 ti += 1
+                xi = _consume_slide_dest(xi, tab_tup)
                 matched = True
                 break
 
@@ -186,6 +227,7 @@ def _match_within_measure(
                 result[xi] = (alt[1], alt[2], alt[3], alt[4], alt[5], alt[6])
                 xi += 1
                 ti = ti + skip_t + 1
+                xi = _consume_slide_dest(xi, alt)
                 matched = True
                 break
 
@@ -253,8 +295,17 @@ def _match_by_measure(
         tab_notes: list[tuple] = []
         for ev in sorted(md.notes, key=lambda n: (n.col, n.string)):
             midi = note_midi(ev.string, ev.fret, tuning_midi)
+            # For slide notes, compute (dest_midi, dest_fret) so the matcher
+            # can annotate the MIDI slide-destination note-on with the correct
+            # string/fret rather than letting it fall through to pitch-fallback.
+            slide_dest_midi = (
+                note_midi(ev.string, ev.slide_to, tuning_midi)
+                if ev.slide_to is not None else None
+            )
+            slide_dest_fret = ev.slide_to  # None if not a slide
             tab_notes.append((midi, ev.string, ev.fret, ev.finger,
-                              ev.technique, ev.rh_finger, ev.harmonic))
+                              ev.technique, ev.rh_finger, ev.harmonic,
+                              slide_dest_midi, slide_dest_fret))
 
         if not xml_notes or not tab_notes:
             continue
