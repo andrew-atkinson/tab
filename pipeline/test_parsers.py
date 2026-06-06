@@ -408,6 +408,58 @@ class TestExtractNotes(unittest.TestCase):
         notes = extract_notes("--5/7-", 1, 0, "E4", tuning)
         self.assertEqual(notes[0].technique, "slide_up")
 
+    def test_slide_destination_not_separate_note(self):
+        """1/5 must produce ONE NoteEvent, not two. The 5 is slide_to, not a new note."""
+        from tab_parser import extract_notes, tuning_to_midi
+        tuning = tuning_to_midi("EADGBE")
+        notes = extract_notes("--1/5--", 4, 0, "D3", tuning)
+        self.assertEqual(len(notes), 1,
+            f"Expected 1 note for '1/5', got {len(notes)}: "
+            f"{[(n.fret, n.technique) for n in notes]}")
+        self.assertEqual(notes[0].fret, 1)
+        self.assertEqual(notes[0].technique, "slide_up")
+        self.assertEqual(notes[0].slide_to, 5)
+
+    def test_slide_up_stores_destination(self):
+        """slide_to field carries the target fret."""
+        from tab_parser import extract_notes, tuning_to_midi
+        tuning = tuning_to_midi("EADGBE")
+        notes = extract_notes("--3/7--", 1, 0, "E4", tuning)
+        self.assertEqual(notes[0].slide_to, 7)
+
+    def test_slide_down_destination(self):
+        """7\\5 (slide down) also stores slide_to and produces one note."""
+        from tab_parser import extract_notes, tuning_to_midi
+        tuning = tuning_to_midi("EADGBE")
+        notes = extract_notes("--7\\5--", 1, 0, "E4", tuning)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].fret, 7)
+        self.assertEqual(notes[0].technique, "slide_down")
+        self.assertEqual(notes[0].slide_to, 5)
+
+    def test_slide_without_destination_still_works(self):
+        """A bare '/' with no trailing digit keeps existing behaviour."""
+        from tab_parser import extract_notes, tuning_to_midi
+        tuning = tuning_to_midi("EADGBE")
+        notes = extract_notes("--5/--", 1, 0, "E4", tuning)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].technique, "slide_up")
+        self.assertIsNone(notes[0].slide_to)
+
+    def test_choros_bar4_no_spurious_slide_note(self):
+        """Bar 4 of Choros No.1 must NOT have a phantom fret-5 note on string 4."""
+        from tab_parser import parse_tab, get_beats
+        lines = _load('villa-lobos_choros_01.txt')
+        measures = parse_tab(lines, "EADGBE")
+        md = measures[4]
+        beats = get_beats(md.notes)
+        # Confirm no spurious fret-5 note on any string
+        all_s4 = [(n.fret, n.technique, n.slide_to)
+                  for b in beats for n in b if n.string == 4]
+        fret5_notes = [x for x in all_s4 if x[0] == 5 and x[2] is None]
+        self.assertEqual(fret5_notes, [],
+            f"Spurious fret-5 note still present: {fret5_notes}")
+
     def test_midi_pitch_computed(self):
         """open note on string 1 (E4) = MIDI 64; fret 5 = MIDI 69."""
         from tab_parser import extract_notes, tuning_to_midi

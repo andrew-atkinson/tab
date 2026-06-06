@@ -127,42 +127,31 @@ def _all_xml_pitched_notes(part: ET.Element) -> list[tuple[int, ET.Element]]:
 
 
 # ---------------------------------------------------------------------------
-# Global tab note sequence
+# Per-measure matching  (tab is canonical)
 # ---------------------------------------------------------------------------
 
-def _all_tab_notes_in_order(tab: TabFile, tuning_midi: list[int]) -> list[tuple]:
+def _match_within_measure(
+    xml_notes: list[tuple[int, ET.Element]],
+    tab_notes: list[tuple],
+) -> dict[int, tuple]:
     """
-    Return [(midi, string, fret, finger, technique, rh_finger, harmonic), ...]
-    sorted by (measure_number, col).  Sounding pitch — no octave shift needed.
-    """
-    result = []
-    for mnum in sorted(tab.measures):
-        md = tab.measures[mnum]
-        for ev in sorted(md.notes, key=lambda n: (n.col, n.string)):
-            midi = note_midi(ev.string, ev.fret, tuning_midi)
-            result.append((midi, ev.string, ev.fret, ev.finger,
-                           ev.technique, ev.rh_finger, ev.harmonic))
-    return result
+    Match *xml_notes* to *tab_notes* within a single measure using
+    pitch proximity (±2 semitones) with a short lookahead.
 
+    The tab is canonical: when the MIDI has extra notes the algorithm
+    skips them (they receive pitch-fallback annotation later).  When the
+    tab has extra notes (e.g. a spurious slide target) the algorithm
+    skips those tab notes so they cannot consume a real MIDI note.
 
-# ---------------------------------------------------------------------------
-# Global sequential matching
-# ---------------------------------------------------------------------------
-
-def _match_globally(xml_notes_with_offset: list[tuple[int, ET.Element]],
-                    tab_notes: list[tuple]) -> dict[int, tuple]:
-    """
-    Match XML notes to tab notes positionally.
-    Returns {xml_index: (string, fret, finger, tech, rh_finger, harmonic)}.
+    Returns {local_xml_index: (string, fret, finger, tech, rh_finger, harmonic)}.
     """
     LOOKAHEAD = 4
     result: dict[int, tuple] = {}
-
     xi = 0
     ti = 0
 
-    while xi < len(xml_notes_with_offset) and ti < len(tab_notes):
-        _, xml_note = xml_notes_with_offset[xi]
+    while xi < len(xml_notes) and ti < len(tab_notes):
+        _, xml_note = xml_notes[xi]
         tab_midi, string, fret, finger, tech, rh_finger, harmonic = tab_notes[ti]
         xml_midi = _xml_note_midi(xml_note)
 
@@ -172,12 +161,12 @@ def _match_globally(xml_notes_with_offset: list[tuple[int, ET.Element]],
             ti += 1
             continue
 
-        # Try skipping XML notes
+        # Try skipping XML notes (extra MIDI notes not in the tab)
         matched = False
         for skip_x in range(1, LOOKAHEAD + 1):
-            if xi + skip_x >= len(xml_notes_with_offset):
+            if xi + skip_x >= len(xml_notes):
                 break
-            _, cand = xml_notes_with_offset[xi + skip_x]
+            _, cand = xml_notes[xi + skip_x]
             if abs(_xml_note_midi(cand) - tab_midi) <= 2:
                 result[xi + skip_x] = (string, fret, finger, tech, rh_finger, harmonic)
                 xi = xi + skip_x + 1
@@ -188,7 +177,7 @@ def _match_globally(xml_notes_with_offset: list[tuple[int, ET.Element]],
         if matched:
             continue
 
-        # Try skipping tab notes
+        # Try skipping tab notes (e.g. slide targets without a MIDI note)
         for skip_t in range(1, LOOKAHEAD + 1):
             if ti + skip_t >= len(tab_notes):
                 break
@@ -202,6 +191,77 @@ def _match_globally(xml_notes_with_offset: list[tuple[int, ET.Element]],
 
         if not matched:
             xi += 1
+
+    return result
+
+
+def _match_by_measure(
+    root: ET.Element,
+    tab: TabFile,
+    tuning_midi: list[int],
+) -> dict[int, tuple]:
+    """
+    Match MIDI notes to tab notes **measure by measure**, using the tab as
+    the canonical reference.
+
+    Tab measure N is paired sequentially with MIDI measure N.  Within each
+    measure, pitch-based matching (via _match_within_measure) assigns each
+    XML note the tab's (string, fret, finger, technique, rh_finger, harmonic).
+    MIDI notes that find no tab match within their measure receive
+    pitch-fallback annotation later; tab notes that find no MIDI match are
+    simply skipped (the nearest MIDI note in the measure keeps its pitch
+    fallback).
+
+    This prevents drift: a note-count imbalance in one bar cannot push the
+    pointers out of sync for subsequent bars.
+
+    Returns {id(note_el): (string, fret, finger, tech, rh_finger, harmonic)}.
+    """
+    part = root.find('.//part')
+    if part is None:
+        return {}
+
+    xml_measures = part.findall('measure')
+    tab_keys     = sorted(tab.measures.keys())
+    result: dict[int, tuple] = {}   # id(note_el) → annotation tuple
+
+    for meas_idx, tab_mnum in enumerate(tab_keys):
+        if meas_idx >= len(xml_measures):
+            break
+
+        xml_meas = xml_measures[meas_idx]
+        md       = tab.measures[tab_mnum]
+
+        # Collect XML pitched notes from this measure with local beat offsets
+        xml_notes: list[tuple[int, ET.Element]] = []
+        offset   = 0
+        prev_dur = 0
+        for note_el in xml_meas.findall('note'):
+            is_chord = note_el.find('chord') is not None
+            is_rest  = note_el.find('rest')  is not None
+            dur      = int(note_el.findtext('duration', '0'))
+            if is_chord:
+                note_off = offset - prev_dur
+            else:
+                note_off = offset
+                prev_dur = dur
+                offset  += dur
+            if not is_rest and note_el.find('pitch') is not None:
+                xml_notes.append((note_off, note_el))
+
+        # Collect tab notes for this measure sorted by (col, string)
+        tab_notes: list[tuple] = []
+        for ev in sorted(md.notes, key=lambda n: (n.col, n.string)):
+            midi = note_midi(ev.string, ev.fret, tuning_midi)
+            tab_notes.append((midi, ev.string, ev.fret, ev.finger,
+                              ev.technique, ev.rh_finger, ev.harmonic))
+
+        if not xml_notes or not tab_notes:
+            continue
+
+        local_matches = _match_within_measure(xml_notes, tab_notes)
+        for local_xi, match_val in local_matches.items():
+            result[id(xml_notes[local_xi][1])] = match_val
 
     return result
 
@@ -366,21 +426,21 @@ def annotate(xml_path: str, tab: TabFile, out_path: str) -> str:
                 ET.SubElement(dt, 'words').text = f'Capo {tab.metadata.capo}'
                 first_measure.insert(0, d)
 
-    # ── Global note matching + pitch fallback ───────────────────────────────
-    # Collect pitched notes from ALL parts (some MIDIs export as 2 tracks)
-    all_parts = root.findall('.//part')
+    # ── Note matching: tab is canonical, matched measure-by-measure ────────────
+    # _merge_parts has already collapsed all MIDI parts into one.
+    # _match_by_measure pairs tab measure N with MIDI measure N and matches
+    # notes locally so that note-count imbalances in one bar cannot drift
+    # into subsequent bars.
+    _merge_parts(root)
 
-    xml_all: list[tuple[int, ET.Element]] = []
-    for p in all_parts:
-        xml_all.extend(_all_xml_pitched_notes(p))
-    xml_all.sort(key=lambda x: x[0])   # merge by beat offset
+    matches = _match_by_measure(root, tab, tuning_midi)
 
-    tab_all = _all_tab_notes_in_order(tab, tuning_midi)
-    matches = _match_globally(xml_all, tab_all)
-
-    for xi, (offset, note_el) in enumerate(xml_all):
-        if xi in matches:
-            string, fret, finger, tech, rh_finger, harmonic = matches[xi]
+    for note_el in root.findall('.//note'):
+        if note_el.find('pitch') is None or note_el.find('rest') is not None:
+            continue
+        note_id = id(note_el)
+        if note_id in matches:
+            string, fret, finger, tech, rh_finger, harmonic = matches[note_id]
             _add_technical(note_el, string, fret, finger, tech,
                            rh_finger=rh_finger, harmonic=harmonic)
         else:
@@ -389,23 +449,13 @@ def annotate(xml_path: str, tab: TabFile, out_path: str) -> str:
             if pos:
                 _add_technical(note_el, pos[0], pos[1], None, None)
 
-    # Collapse all voices within each MIDI part to voice 1 before merging.
-    # This cleans up MIDI polyphony artefacts (music21 can assign notes to
-    # voices 2, 3, … within a single part for simultaneous pitches).
+    # Collapse all voices to voice 1 (cleans up MIDI polyphony artefacts).
     for note_el in root.findall('.//note'):
         voice_el = note_el.find('voice')
         if voice_el is not None:
             voice_el.text = '1'
         else:
             ET.SubElement(note_el, 'voice').text = '1'
-
-    # Merge extra MIDI parts (bass, inner voices) into Part 0.
-    # _merge_parts assigns voice 2 (voice 3, …) to notes from extra parts.
-    # Keeping those voices distinct from voice 1 (melody) is essential:
-    # AlphaTab uses the <backup> + separate voice to render melody and bass
-    # simultaneously. Collapsing both to voice 1 after this point would make
-    # AlphaTab treat the backed-up bass notes as sequential, not simultaneous.
-    _merge_parts(root)
 
     # Add repeat barlines and barre direction text
     _add_repeat_barlines(root, tab)

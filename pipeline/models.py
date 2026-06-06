@@ -22,6 +22,7 @@ class NoteEvent:
     triplet: bool = False
     open_note: str = ""      # open-string note name, e.g. "E4" (tuning-derived)
     midi_pitch: int = -1     # sounding MIDI pitch (-1 = unknown)
+    slide_to: Optional[int] = None  # destination fret for slides, e.g. 1/5 → slide_to=5
 
 
 @dataclass

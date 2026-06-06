@@ -351,6 +351,20 @@ def extract_notes(
             tech_ch = cell[j] if j < len(cell) else ''
             technique = _TECH_MAP.get(tech_ch)
             post = j + (1 if technique else 0)
+
+            # Slide notation: 1/5 or 7\5 — the digit(s) after the technique
+            # character are the *destination* fret, not a separately struck note.
+            # Consume them and store as slide_to so they don't become a phantom
+            # NoteEvent on the next iteration.
+            slide_to: int | None = None
+            if technique in ('slide_up', 'slide_down'):
+                k = post
+                while k < len(cell) and cell[k].isdigit():
+                    k += 1
+                if k > post:
+                    slide_to = int(cell[post:k])
+                    post = k   # skip past the destination fret
+
             tied = post < len(cell) and cell[post] == '='
             midi = note_midi(string_num, fret, tuning_midi)
             events.append(NoteEvent(
@@ -359,8 +373,9 @@ def extract_notes(
                 technique=technique, tied=tied,
                 triplet=inside_triplet,
                 open_note=open_note, midi_pitch=midi,
+                slide_to=slide_to,
             ))
-            pos = j + (1 if technique else 0)
+            pos = post
         else:
             pos += 1
 
