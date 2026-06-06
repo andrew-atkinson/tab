@@ -1157,6 +1157,399 @@ class TestBeatInvariants_Albeniz(BeatInvariantsMixin, unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Slide-destination annotation  (annotate_xml._match_within_measure)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSlideDestAnnotation(unittest.TestCase):
+    """
+    Unit tests for the slide-destination-consume logic in
+    _match_within_measure.
+
+    Each test builds minimal (offset, note_el) pairs and tab_notes tuples
+    and verifies that a MIDI slide-destination note is correctly annotated
+    (string + dest fret) rather than left for pitch-fallback.
+
+    Tab-note tuples have 9 elements:
+        (midi, string, fret, finger, tech, rh_finger, harmonic,
+         slide_dest_midi, slide_dest_fret)
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _note_el(midi: int):
+        """Minimal pitched XML note element for the given MIDI pitch."""
+        import xml.etree.ElementTree as ET
+        semitone   = midi % 12
+        octave     = midi // 12 - 1
+        step_names = ['C','C','D','D','E','F','F','G','G','A','A','B']
+        alters     = [ 0,  1,  0,  1,  0,  0,  1,  0,  1,  0,  1,  0]
+        note  = ET.Element('note')
+        pitch = ET.SubElement(note, 'pitch')
+        ET.SubElement(pitch, 'step').text   = step_names[semitone]
+        if alters[semitone]:
+            ET.SubElement(pitch, 'alter').text = '1'
+        ET.SubElement(pitch, 'octave').text = str(octave)
+        ET.SubElement(note, 'duration').text = '1'
+        return note
+
+    def _xml(self, *midis):
+        """Return xml_notes list from MIDI values (offset = position index)."""
+        return [(i, self._note_el(m)) for i, m in enumerate(midis)]
+
+    def _tab(self, midi, string, fret, tech=None,
+             slide_dest_midi=None, slide_dest_fret=None):
+        """Return a 9-element tab_notes entry."""
+        return (midi, string, fret, None, tech, None, False,
+                slide_dest_midi, slide_dest_fret)
+
+    # ── core: direct-match path ──────────────────────────────────────────
+
+    def test_dest_annotated_on_direct_match(self):
+        """
+        When the slide source matches directly, the immediately following MIDI
+        note (matching the slide dest pitch) must be annotated with the dest
+        fret, not left for pitch-fallback.
+
+        Simulates Choros No.1 bar 4: s4 1/5, source D#3(51)→dest G3(55).
+        """
+        from annotate_xml import _match_within_measure
+        tab    = [self._tab(51, 4, 1, 'slide_up', 55, 5)]
+        xml    = self._xml(51, 55)
+        result = _match_within_measure(xml, tab)
+        self.assertIn(0, result, "Slide source (xi=0) must be matched")
+        self.assertIn(1, result, "Slide dest (xi=1) must be in result, not fallback")
+        self.assertEqual(result[0][:2], (4, 1),  "Source: s4 fret=1")
+        self.assertEqual(result[1][:2], (4, 5),  "Dest:   s4 fret=5")
+
+    def test_dest_annotated_on_direct_match_bar9(self):
+        """
+        Simulates Choros No.1 bar 9: s1 3/7, source G4(67)→dest B4(71).
+        """
+        from annotate_xml import _match_within_measure
+        tab    = [self._tab(67, 1, 3, 'slide_up', 71, 7)]
+        xml    = self._xml(67, 71)
+        result = _match_within_measure(xml, tab)
+        self.assertIn(0, result)
+        self.assertIn(1, result)
+        self.assertEqual(result[0][:2], (1, 3), "Source: s1 fret=3")
+        self.assertEqual(result[1][:2], (1, 7), "Dest:   s1 fret=7")
+
+    def test_dest_technique_is_none(self):
+        """The dest note must NOT inherit the slide technique."""
+        from annotate_xml import _match_within_measure
+        tab    = [self._tab(67, 1, 3, 'slide_up', 71, 7)]
+        result = _match_within_measure(self._xml(67, 71), tab)
+        self.assertIsNone(result[1][3],
+            "Dest note must not carry 'slide_up' technique")
+
+    def test_dest_uses_slide_string(self):
+        """Dest annotation must use the slide's string number."""
+        from annotate_xml import _match_within_measure
+        tab    = [self._tab(51, 4, 1, 'slide_up', 55, 5)]
+        result = _match_within_measure(self._xml(51, 55), tab)
+        self.assertEqual(result[1][0], 4,
+            "Dest string must match the slide's string (4)")
+
+    def test_dest_not_consumed_if_wrong_pitch(self):
+        """
+        If the note after the slide source does NOT match the dest pitch
+        (beyond ±2 semitones), it must NOT be treated as the dest.
+        It should instead be matched normally to the next tab note.
+        """
+        from annotate_xml import _match_within_measure
+        # Slide dest should be 71; next MIDI note is 64 (open e) — no match
+        tab    = [self._tab(67, 1, 3, 'slide_up', 71, 7),
+                  self._tab(64, 1, 0, None, None, None)]
+        xml    = self._xml(67, 64)
+        result = _match_within_measure(xml, tab)
+        # xi=1 (midi=64) must be matched to tab[1] (fret=0), not treated as dest
+        self.assertIn(1, result)
+        self.assertEqual(result[1][1], 0,
+            "xi=1 (midi=64) must map to fret=0, not slide dest fret=7")
+
+    def test_slide_down_dest_annotated(self):
+        """Slide-down (\\) annotation works the same as slide-up."""
+        from annotate_xml import _match_within_measure
+        # s1 7\3: source B4(71) → dest G4(67)
+        tab    = [self._tab(71, 1, 7, 'slide_down', 67, 3)]
+        xml    = self._xml(71, 67)
+        result = _match_within_measure(xml, tab)
+        self.assertIn(1, result)
+        self.assertEqual(result[1][:2], (1, 3), "Slide-down dest: s1 fret=3")
+
+    # ── skip-TAB match path ───────────────────────────────────────────────
+
+    def test_dest_annotated_on_skip_tab_match(self):
+        """
+        When the slide is reached via the skip-TAB path (earlier tab notes
+        skipped because no XML note matches them), the dest MIDI note must
+        still be consumed.
+
+        Replicates Choros No.1 bar 9: three chord notes are skipped before
+        the algorithm reaches the slide note.
+        """
+        from annotate_xml import _match_within_measure
+        # XML: [67(source), 71(dest)]
+        # Tab: [note_60_no_xml_match, note_50_no_xml_match, slide_67→71]
+        tab    = [self._tab(60, 3, 5),
+                  self._tab(50, 5, 5),
+                  self._tab(67, 1, 3, 'slide_up', 71, 7)]
+        xml    = self._xml(67, 71)
+        result = _match_within_measure(xml, tab)
+        self.assertIn(0, result, "Source (xi=0) matched via skip-TAB")
+        self.assertIn(1, result, "Dest (xi=1) annotated after skip-TAB match")
+        self.assertEqual(result[0][:2], (1, 3), "Source: s1 fret=3")
+        self.assertEqual(result[1][:2], (1, 7), "Dest:   s1 fret=7")
+
+    # ── skip-XML match path ───────────────────────────────────────────────
+
+    def test_dest_annotated_on_skip_xml_match(self):
+        """
+        When the slide source is reached via the skip-XML path (one XML note
+        skipped first), the dest must still be consumed.
+        """
+        from annotate_xml import _match_within_measure
+        # XML: [extra_80_skipped, 67(source), 71(dest)]
+        # Tab: [slide_67→71]
+        tab    = [self._tab(67, 1, 3, 'slide_up', 71, 7)]
+        xml    = self._xml(80, 67, 71)   # 80 is skipped; 67 matches; 71 is dest
+        result = _match_within_measure(xml, tab)
+        self.assertIn(1, result, "Source (xi=1) matched via skip-XML")
+        self.assertIn(2, result, "Dest (xi=2) annotated after skip-XML match")
+        self.assertEqual(result[1][:2], (1, 3))
+        self.assertEqual(result[2][:2], (1, 7))
+
+    # ── two slides in one measure ─────────────────────────────────────────
+
+    def test_two_slides_both_dests_consumed(self):
+        """
+        Two slides in one measure: both MIDI dest notes must be annotated.
+        Simulates garcia_gerald bar 34 which has two slides.
+        """
+        from annotate_xml import _match_within_measure
+        # Slide 1: s1 3→7 (67→71), Slide 2: s2 1→5 (60→64)
+        tab    = [self._tab(67, 1, 3, 'slide_up', 71, 7),
+                  self._tab(60, 2, 1, 'slide_up', 64, 5)]
+        xml    = self._xml(67, 71, 60, 64)
+        result = _match_within_measure(xml, tab)
+        self.assertEqual(len(result), 4,
+            "All 4 MIDI notes (2 sources + 2 dests) must be in result")
+        self.assertEqual(result[0][:2], (1, 3), "Slide1 source: s1 fret=3")
+        self.assertEqual(result[1][:2], (1, 7), "Slide1 dest:   s1 fret=7")
+        self.assertEqual(result[2][:2], (2, 1), "Slide2 source: s2 fret=1")
+        self.assertEqual(result[3][:2], (2, 5), "Slide2 dest:   s2 fret=5")
+
+    # ── no slide: unchanged behaviour ────────────────────────────────────
+
+    def test_non_slide_match_unaffected(self):
+        """Normal (non-slide) note matching is unaffected by the new logic."""
+        from annotate_xml import _match_within_measure
+        tab    = [self._tab(64, 1, 0),
+                  self._tab(59, 2, 0)]
+        xml    = self._xml(64, 59)
+        result = _match_within_measure(xml, tab)
+        self.assertEqual(result[0][:2], (1, 0))
+        self.assertEqual(result[1][:2], (2, 0))
+
+    # ── measure isolation ─────────────────────────────────────────────────
+
+    def test_measure_isolation_no_drift(self):
+        """
+        Two consecutive calls (as _match_by_measure makes them) must be
+        independent: excess MIDI notes in measure A cannot push the pointer
+        into measure B.
+
+        This is the fundamental regression guard: pre-fix, the slide dest
+        in bar 9 of Choros No.1 was causing wrong string/fret annotations
+        in bar 10.
+        """
+        from annotate_xml import _match_within_measure
+
+        # Measure A: 1 tab note (slide), 2 MIDI notes (source + dest)
+        tab_a  = [self._tab(67, 1, 3, 'slide_up', 71, 7)]
+        xml_a  = self._xml(67, 71)
+        result_a = _match_within_measure(xml_a, tab_a)
+
+        # Measure B: simple 2-note match, no slide — must be fully correct
+        tab_b  = [self._tab(64, 1, 0),
+                  self._tab(59, 2, 0)]
+        xml_b  = self._xml(64, 59)
+        result_b = _match_within_measure(xml_b, tab_b)
+
+        self.assertEqual(result_b.get(0, (None, -1, None))[:2], (1, 0),
+            "Measure B first note corrupted by measure A's slide excess")
+        self.assertEqual(result_b.get(1, (None, -1, None))[:2], (2, 0),
+            "Measure B second note corrupted by measure A's slide excess")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Real-file slide integration  (Choros No. 1, bars 4, 9, 10)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestChoros01SlideAnnotation(unittest.TestCase):
+    """
+    Integration tests verifying the full annotate_xml pipeline on Choros
+    No. 1:
+
+      • Bar 4 — 1/5 slide on string 4: MIDI dest (G3=55) → s4 fret=5
+      • Bar 9 — 3/7 slide on string 1: MIDI dest (B4=71) → s1 fret=7
+      • Bar 9 — slide source (G4=67) correctly kept as s1 fret=3
+      • Bar 10 — no invalid string/fret values; fret=10 high note intact
+
+    Each assertion would have failed before the _consume_slide_dest fix.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import warnings
+        warnings.filterwarnings('ignore')
+        import tempfile, os
+        import xml.etree.ElementTree as ET
+        from parse_txt import parse
+        from tab_parser import tuning_to_midi
+        from convert_mid import mid_to_musicxml
+        from annotate_xml import _merge_parts, _match_by_measure, _xml_note_midi
+
+        txt = CLASSTAB / 'villa-lobos_choros_01.txt'
+        mid = CLASSTAB / 'villa-lobos_choros_01.mid'
+
+        if not txt.exists() or not mid.exists():
+            cls._available = False
+            return
+
+        cls._available = True
+        tab = parse(str(txt))
+        cls._xml_note_midi = staticmethod(_xml_note_midi)
+
+        tuning_midi = tuning_to_midi(tab.metadata.tuning)
+
+        tmp = tempfile.mktemp(suffix='.xml')
+        try:
+            mid_to_musicxml(str(mid), tmp)
+            root = ET.parse(tmp).getroot()
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        _merge_parts(root)
+        cls._matches = _match_by_measure(root, tab, tuning_midi)
+        part = root.find('.//part')
+        cls._xml_measures = part.findall('measure')
+
+    def setUp(self):
+        if not self._available:
+            self.skipTest("villa-lobos_choros_01 files not found in tab/")
+
+    def _pitched(self, meas_idx):
+        """Pitched, non-rest notes from the given measure index (0-based)."""
+        return [n for n in self._xml_measures[meas_idx].findall('note')
+                if n.find('pitch') is not None
+                and n.find('rest') is None]
+
+    def _annotation(self, note_el):
+        """Return (string, fret) from matches, or None if unmatched."""
+        nid = id(note_el)
+        if nid in self._matches:
+            m = self._matches[nid]
+            return m[0], m[1]
+        return None
+
+    # ── bar 4: 1/5 slide on string 4 ─────────────────────────────────────
+
+    def test_bar4_slide_source_s4_fret1(self):
+        """Bar 4: slide source D#3(51) must be annotated as s4 fret=1."""
+        sources = [n for n in self._pitched(3)
+                   if self._xml_note_midi(n) == 51]
+        # Last 51 in the bar is the slide source (earlier 51s are chord hits)
+        self.assertTrue(sources, "midi=51 note not found in bar 4")
+        ann = self._annotation(sources[-1])
+        self.assertIsNotNone(ann, "Slide source (midi=51, last) must be matched")
+        self.assertEqual(ann, (4, 1), f"Expected (s4, fret=1), got {ann}")
+
+    def test_bar4_slide_dest_s4_fret5(self):
+        """
+        Bar 4: slide dest G3(55) must be annotated as s4 fret=5, not left for
+        pitch-fallback (which would return s3 fret=0 — a spurious open-G note).
+        """
+        dest_notes = [n for n in self._pitched(3)
+                      if self._xml_note_midi(n) == 55]
+        self.assertTrue(dest_notes, "midi=55 (slide dest) not found in bar 4")
+        dest = dest_notes[-1]
+        self.assertIn(id(dest), self._matches,
+            "Slide dest (midi=55) must be in matches, not pitch-fallback")
+        ann = self._annotation(dest)
+        self.assertEqual(ann[0], 4, f"Dest must be on string 4, got s{ann[0]}")
+        self.assertEqual(ann[1], 5, f"Dest must be fret=5, got fret={ann[1]}")
+
+    # ── bar 9: 3/7 slide on string 1 ─────────────────────────────────────
+
+    def test_bar9_slide_source_s1_fret3(self):
+        """Bar 9: slide source G4(67) must be annotated as s1 fret=3."""
+        sources = [n for n in self._pitched(8)
+                   if self._xml_note_midi(n) == 67]
+        self.assertTrue(sources, "midi=67 (slide source) not found in bar 9")
+        ann = self._annotation(sources[-1])
+        self.assertIsNotNone(ann, "Slide source (midi=67) must be matched")
+        self.assertEqual(ann, (1, 3), f"Expected (s1, fret=3), got {ann}")
+
+    def test_bar9_slide_dest_s1_fret7(self):
+        """
+        Bar 9: slide dest B4(71) must be annotated as s1 fret=7, not left
+        for pitch-fallback (which would return s1 fret=7 by luck from
+        _pitch_to_string_fret, but ONLY because fret=7 happens to be the
+        lowest; in other keys the fallback would be wrong).
+        """
+        dests = [n for n in self._pitched(8)
+                 if self._xml_note_midi(n) == 71]
+        self.assertTrue(dests, "midi=71 (slide dest) not found in bar 9")
+        dest = dests[-1]
+        self.assertIn(id(dest), self._matches,
+            "Slide dest (midi=71) in bar 9 must be explicitly matched")
+        ann = self._annotation(dest)
+        self.assertEqual(ann[0], 1, f"Dest must be on string 1, got s{ann[0]}")
+        self.assertEqual(ann[1], 7, f"Dest must be fret=7, got fret={ann[1]}")
+
+    # ── bar 10: no corruption from bar 9 slide ────────────────────────────
+
+    def test_bar10_no_invalid_string_or_fret(self):
+        """
+        Bar 10 must contain no matched note with string < 1, string > 6, or
+        fret < 0.  Any such value indicates drift from the bar-9 slide.
+
+        Pre-fix, the bar-9 slide dest landing in pitch-fallback would produce
+        a spurious extra note in bar 9.  This is an independent per-measure
+        test, but since _match_by_measure is measure-isolated, bar 10 should
+        be clean regardless; we verify it explicitly.
+        """
+        for note in self._pitched(9):
+            ann = self._annotation(note)
+            if ann is None:
+                continue   # unmatched → pitch-fallback; tested separately below
+            string, fret = ann
+            self.assertGreaterEqual(string, 1, f"bar 10: string={string} < 1")
+            self.assertLessEqual(string,   6, f"bar 10: string={string} > 6")
+            self.assertGreaterEqual(fret,   0, f"bar 10: fret={fret} < 0")
+
+    def test_bar10_high_note_fret10_on_s1(self):
+        """
+        Bar 10's highest note is D#5 (midi=74, s1 fret=10).
+        Whether matched or pitch-fallback, it must resolve to (s1, fret=10).
+        """
+        from annotate_xml import _pitch_to_string_fret
+        midi74 = next(
+            (n for n in self._pitched(9) if self._xml_note_midi(n) == 74),
+            None)
+        self.assertIsNotNone(midi74,
+            "midi=74 (fret 10 on s1) must exist in bar 10")
+        ann = self._annotation(midi74)
+        if ann is None:
+            ann = _pitch_to_string_fret(74)
+        self.assertEqual(ann[0], 1,  f"midi=74 must be on s1, got s{ann[0]}")
+        self.assertEqual(ann[1], 10, f"midi=74 must be fret=10, got {ann[1]}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Integration tests — parse_txt.parse
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1259,6 +1652,9 @@ def main():
         TestBeatInvariants_Barrios,
         TestBeatInvariants_Bach,
         TestBeatInvariants_Albeniz,
+        # Slide-destination annotation
+        TestSlideDestAnnotation,
+        TestChoros01SlideAnnotation,
         # Integration
         TestIntegration,
     ]:
