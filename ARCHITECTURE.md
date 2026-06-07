@@ -1,38 +1,34 @@
-# Parser Architecture — Tab-Primary Design
+# Architecture — Tab-Primary Pipeline
 
-## Problem with the current approach
-
-The current pipeline converts the MIDI to MusicXML and then tries to reconcile it
-with the tab by matching notes pitch-by-pitch (±2 semitones, with lookahead).
-This causes:
-
-- **Bar-count mismatches** — the MIDI plays repeated sections through; the tab
-  writes them once with repeat signs.  The pipeline had no concept of repeats.
-- **Chord ordering errors** — MIDI encodes chords low→high; the tab orders them
-  by string (high→low).  Pitch matching produced duplicate string assignments.
-- **Slide artifacts** — the MIDI emits two note-on events for a slide (source +
-  destination); the tab has one `NoteEvent` with `slide_to`.  The extra MIDI note
-  fell through to pitch-fallback.
-- **Cross-beat drift** — the lookahead allowed MIDI notes from beat N to match
-  tab notes from beat N+1, corrupting voicing.
-
-The root cause is architectural: treating the MIDI as the score and the tab as an
-annotation instead of the other way around.
-
----
-
-## New design principle
+## Design principle
 
 > **The `.txt` tab file is the complete musical score.**
 > The `.mid` file is a timing oracle — it provides only beat durations.
 
 | Source | Provides |
 |--------|----------|
-| `.txt` tab | Notes, strings, frets, rhythm (beat order), techniques (slide, hammer, pull, bend, vibrato, harmonic), left-hand fingering, right-hand (pima) fingering, barres, repeats, voltas, dynamics, time signature, key, tempo hint, tuning, title, composer |
-| `.mid` MIDI | Absolute duration of each beat group within each measure, tempo map |
+| `.txt` tab | Notes, strings, frets, beat order, techniques (slide, hammer-on, pull-off, bend, vibrato, harmonic), left-hand fingering, right-hand (pima) fingering, barres, repeats, voltas, time signature, key, tempo hint, tuning, title, composer |
+| `.mid` MIDI | Duration in ticks of each beat group within each measure; tempo map; per-measure time signature (used for mid-piece changes) |
 
-The MIDI is *never* used to determine which notes are played, on which strings,
-or in what order.  It is used solely to answer: "how long does beat group i last?"
+The MIDI is never used to determine which notes are played, on which strings, or
+in what order. It answers one question only: "how long does beat group *i* last?"
+
+---
+
+## Why this matters
+
+The previous pipeline converted the MIDI to MusicXML and matched tab notes into
+it pitch-by-pitch (±2 semitones, 4-note lookahead). That caused:
+
+- **Bar-count mismatches** — the MIDI plays repeated sections in full; the tab
+  writes them once with repeat signs. The old pipeline had no concept of repeats.
+- **Chord ordering errors** — MIDI encodes chords low→high; tab orders by string
+  (high→low). Pitch matching produced duplicate string assignments.
+- **Slide artifacts** — a slide `4/7` in the MIDI is two note-on events; in the
+  tab it's one `NoteEvent` with `slide_to=7`. The extra MIDI note fell through to
+  a pitch-fallback path.
+- **Cross-beat drift** — lookahead allowed MIDI notes from beat N to match tab
+  notes from beat N+1, corrupting voicing.
 
 ---
 
@@ -40,392 +36,263 @@ or in what order.  It is used solely to answer: "how long does beat group i last
 
 ```
 pipeline/
-├── parse_txt.py          (existing — entry point)
-├── topmatter_parser.py   (existing — header parsing)
-├── tab_parser.py         (existing — tab body; add bar_count_info helpers)
-├── bottom_parser.py      (existing — footer / dynamics)
+├── parse_txt.py          Entry point — ties the three parsers together
+├── topmatter_parser.py   Header parsing (tuning, title, composer, time sig, …)
+├── tab_parser.py         Tab body — systems, beats, fingering, notes, techniques
+├── bottom_parser.py      Footer — legend, dynamics, biographical info
 │
-├── repeat_expander.py    (NEW)
-│   Expands the written score (with repeat signs) into performance order.
+├── repeat_expander.py    Expands written score into performance order
+├── midi_timing.py        Reads raw MIDI events → per-measure TimingMap (uses mido)
+├── score_builder.py      Builds annotated MusicXML from ExpandedScore + TimingMap
 │
-├── midi_timing.py        (NEW)
-│   Reads raw MIDI events to produce a per-measure timing map.
-│   Does NOT use music21 MusicXML conversion.
+├── generate_site.py      Static AlphaTab website generator (unchanged)
+├── main.py               CLI orchestrator
 │
-├── score_builder.py      (NEW)
-│   Builds annotated MusicXML directly from the expanded tab score
-│   plus the MIDI timing map.  No pitch matching.
+├── annotate_xml.py       Legacy (superseded by score_builder; kept for reference)
+├── convert_mid.py        Legacy (superseded by midi_timing; kept for reference)
 │
-├── annotate_xml.py       (DEPRECATED — replaced by score_builder)
-├── convert_mid.py        (DEPRECATED — no longer needed)
-│
-├── issues_log.py         (existing — logging)
-├── check_issues.py       (existing — diagnostic runner)
-├── generate_site.py      (existing — static site; unchanged)
-└── main.py               (updated orchestrator)
+├── issues_log.py         Structured issue logging
+└── check_issues.py       Diagnostic runner over the corpus
+```
+
+---
+
+## Data flow
+
+```
+txt → parse_txt()       →  TabFile
+                               │
+                         expand_repeats()  →  ExpandedScore
+                               │                   │
+mid → extract_timing()  →  TimingMap               │
+                               │                   │
+                         build_musicxml(expanded, timing)
+                               │
+                         annotated MusicXML (ET.Element)
+                               │
+                         write XML → output/musicxml/
+                               │
+                         generate_site()  →  output/site/
 ```
 
 ---
 
 ## Data models
 
-### New models (add to `models.py`)
+All models live in `models.py`.
 
-```python
-@dataclass
-class BeatGroupTiming:
-    """
-    Timing for one simultaneous beat group within a measure, derived from MIDI.
+### Parse-time models
 
-    onset_ticks   : absolute tick position of this beat group's first note-on
-    duration_ticks: length of this beat in ticks (gap to next beat group onset,
-                    or to end of measure for the last group)
-    midi_pitches  : frozenset of MIDI pitches at this beat (for cross-validation
-                    only — never used to override tab notes)
-    """
-    onset_ticks   : int
-    duration_ticks: int
-    midi_pitches  : frozenset[int]
+```
+TabFile
+├── metadata : TabMetadata
+│   ├── title, composer, composer_dates, transcriber
+│   ├── tuning          "EADGBE"  (low→high)
+│   ├── key, time_sig, tempo, tempo_unit, capo
+│   ├── notes_text, dynamics, biographical, chords
+├── measures : dict[int, MeasureData]
+│   └── MeasureData
+│       ├── number
+│       ├── repeat_start, repeat_end, volta
+│       ├── barres   : list[BarreMarker]
+│       └── notes    : list[NoteEvent]
+│           ├── string (1=high e … 6=low E), fret, col
+│           ├── midi_pitch, open_note
+│           ├── finger (LH 1-4), rh_finger (pima)
+│           ├── technique  (slide_up/slide_down/hammer/pull/bend/vibrato)
+│           ├── slide_to   (int | None — destination fret)
+│           ├── touch_fret (int | None — artificial harmonic touch point)
+│           ├── tied, harmonic, triplet
+└── raw_text : str
+```
 
+### Pipeline models
 
-@dataclass
-class MeasureTiming:
-    """
-    Timing for one measure as extracted from the MIDI.
+```
+ExpandedScore
+└── measures : list[ExpandedMeasure]
+    └── source_num, notes, barres,
+        repeat_start, repeat_end, volta, pass_number
 
-    measure_idx     : 0-based sequential index in the MIDI file
-    onset_ticks     : absolute tick of the measure's first beat
-    beat_groups     : beat groups in onset order
-    tempo_bpm       : tempo at the start of this measure (quarter notes / min)
-    divisions       : MIDI ticks per quarter note
-    time_sig_num    : numerator  (e.g. 2 for 2/4)
-    time_sig_denom  : denominator (e.g. 4 for 2/4)
-    """
-    measure_idx   : int
-    onset_ticks   : int
-    beat_groups   : list[BeatGroupTiming]
-    tempo_bpm     : float
-    divisions     : int
-    time_sig_num  : int
-    time_sig_denom: int
-
-
-@dataclass
-class TimingMap:
-    """Complete timing information extracted from one MIDI file."""
-    measures  : list[MeasureTiming]   # one per MIDI measure, in order
-    divisions : int                    # ticks per quarter note (global)
-
-
-@dataclass
-class ExpandedMeasure:
-    """
-    One measure in performance order after repeat expansion.
-
-    source_num    : original bar number in the .txt file
-    notes         : NoteEvents (from tab_parser — complete, unchanged)
-    barres        : BarreMarkers (from tab_parser)
-    repeat_start  : True if a forward repeat opens on this bar
-    repeat_end    : True if a backward repeat closes on this bar
-    volta         : 1 or 2 for first/second ending; None otherwise
-    pass_number   : 1 = first time through, 2 = repeat pass, etc.
-    """
-    source_num  : int
-    notes       : list            # list[NoteEvent]
-    barres      : list            # list[BarreMarker]
-    repeat_start: bool
-    repeat_end  : bool
-    volta       : int | None
-    pass_number : int
-
-
-@dataclass
-class ExpandedScore:
-    """
-    The tab score in performance order (repeats expanded).
-    len(measures) should equal TimingMap.len(measures) after expansion.
-    """
-    measures: list[ExpandedMeasure]
-    metadata: object   # TabMetadata (unchanged)
+TimingMap
+└── measures : list[MeasureTiming]
+    └── measure_idx, onset_ticks, total_ticks, divisions,
+        tempo_bpm, time_sig_num, time_sig_denom,
+        beat_groups : list[BeatGroupTiming]
+            └── onset_ticks, duration_ticks, midi_pitches
 ```
 
 ---
 
-## Module interfaces
+## `repeat_expander.py`
 
-### `repeat_expander.py`
+Converts the written score into performance order. Two strategies are selected
+automatically based on the ratio of gap bar numbers to written bar numbers
+(threshold: 5 %):
 
-```python
-def expand_repeats(tab: TabFile) -> ExpandedScore:
-    """
-    Convert the written score into performance order by expanding repeat signs.
+### Gap-encoded repeats (El Negrito / Lauro style)
 
-    Algorithm
-    ---------
-    Uses a stack-based state machine that scans through tab.measures in key
-    order and tracks the current repeat context:
+The transcriber numbers bars as if repeats are already played out, then writes
+only unique bars. Gap bar numbers in the range `[min_key, max_key]` are aliases
+for repeated source bars.
 
-    1.  Walk measure keys in ascending order.
-    2.  When a measure has repeat_start=True, push the current key onto the
-        repeat_stack.
-    3.  When a measure has repeat_end=True:
-        a.  Pop the matching repeat_start key (start_key).
-        b.  If volta brackets exist within this span:
-            - First pass:  include measures from start_key to the '1.' volta end.
-            - Second pass: skip the '1.' volta; include from start_key to the
-              '2.' volta end.
-        c.  Without voltas: append the section [start_key..current] twice.
-    4.  Continue until all measures are consumed.
-    5.  Any measures after the last repeat end are appended once (coda).
-
-    Gap bars (measure numbers that appear in the range but not in tab.measures)
-    are naturally handled: on the second pass, those absent measure numbers
-    are mapped back to the original source measures (they are the repeated
-    content, not new material).
-
-    Returns
-    -------
-    ExpandedScore whose measures are in the order a performer would play them.
-    Each ExpandedMeasure retains its original source_num so that bar numbers
-    reported in the issues log remain traceable to the written score.
-    """
+```
+Written bars:  1  2  3  4     7  8
+Gap bars:               5  6
+Gap alias:     5→3  6→4
+Performance:   1  2  3  4  3  4  7  8
 ```
 
-### `midi_timing.py`
+The alias map is built by matching gap positions to the nearest preceding repeat
+section (identified by `||:` / `:|` markers). Remaining unaliased gaps fall back
+to the nearest preceding written bar.
 
-```python
-def extract_timing(mid_path: str) -> TimingMap:
-    """
-    Read a MIDI file and return per-measure beat-group timing.
+### Sign-encoded repeats (Barrios / Choros style)
 
-    Uses `mido` (raw MIDI events) instead of music21/MusicXML conversion.
-    No pitches are needed; only note-on onset times are collected.
+Explicit `||:` and `:|` signs on the string lines. A stack-based expander walks
+measure keys in order, pushing on `repeat_start` and replaying sections on
+`repeat_end`.
 
-    Algorithm
-    ---------
-    1.  Read all tracks; merge into a single event stream sorted by
-        absolute tick.
-    2.  Build a tempo map: list of (tick, microseconds_per_quarter) from
-        set_tempo events.
-    3.  Identify measure boundaries from time_signature events and the
-        total ticks per measure.
-    4.  Within each measure, group simultaneous note-on events (same tick)
-        into BeatGroupTiming objects.
-    5.  Compute duration_ticks for each beat group = next group's onset −
-        this group's onset (or measure end for the last group).
+Volta brackets (`1___`, `2___` in the measure-number line):
+- Pass 1: plays `volta=1` measures, skips `volta=2`.
+- Pass 2: skips `volta=1`, plays `volta=2`.
 
-    Returns
-    -------
-    TimingMap with one MeasureTiming per MIDI measure.
-
-    Notes
-    -----
-    -  MIDI pitch data is stored in BeatGroupTiming.midi_pitches only as a
-       cross-validation aid.  It is never used to override tab notes.
-    -  Multiple MIDI tracks are merged; simultaneous notes from different
-       tracks at the same tick are combined into one beat group.
-    """
-
-
-def ticks_to_musicxml_duration(
-    ticks: int,
-    divisions: int,
-    time_sig_denom: int,
-) -> tuple[int, str, int]:
-    """
-    Convert a raw tick duration into MusicXML duration components.
-
-    Returns (duration_value, note_type_string, dots) where:
-      duration_value : the <duration> element value (in divisions)
-      note_type_string: 'quarter', 'eighth', 'half', '16th', etc.
-      dots           : number of augmentation dots (0, 1, or 2)
-
-    Uses the nearest standard rhythmic value; logs a warning for
-    irregular durations that don't map cleanly.
-    """
-```
-
-### `score_builder.py`
-
-```python
-def build_musicxml(
-    expanded: ExpandedScore,
-    timing:   TimingMap,
-) -> ET.Element:
-    """
-    Construct a complete annotated MusicXML document from the tab (source of
-    truth) and MIDI timing.
-
-    Measure alignment
-    -----------------
-    expanded.measures[i] is paired with timing.measures[i] by sequential
-    position — no pitch matching.  After repeat expansion the counts must
-    match; any residual mismatch is logged as a 'bar_count_mismatch' issue.
-
-    Beat-group alignment within a measure
-    --------------------------------------
-    For measure i:
-      tab_beats  = get_beats(expanded.measures[i].notes)   # grouped by col
-      midi_beats = timing.measures[i].beat_groups           # grouped by onset
-
-    The two lists are zipped by position:
-      tab_beats[j] ↔ midi_beats[j]
-
-    When the lists have different lengths:
-    -  Extra MIDI beats: treated as MIDI artifacts (slide destinations,
-       ornamentation); skipped.  A note is logged if the excess is large.
-    -  Extra tab beats: assigned an estimated duration derived from the
-       measure's remaining time divided equally among the unmatched beats.
-       Logged as a 'timing_estimation' notice.
-
-    For each matched (tab_beat, midi_beat) pair:
-      - Each NoteEvent in tab_beat becomes a MusicXML <note>.
-      - Pitch is computed from (string, fret, tuning) — never from MIDI.
-      - Duration comes from midi_beat.duration_ticks.
-      - <technical>: <string>, <fret> from NoteEvent.
-      - <technical>: <fingering> (LH), <pluck> (RH pima) from NoteEvent.
-      - <technical>: <slide>, <hammer-on>, <pull-off>, <bend> from technique.
-      - Simultaneous notes within the beat → chord (<chord/> elements).
-      - First note in chord: non-chord; rest: <chord/>.
-
-    Repeats
-    -------
-    Repeat barlines are written once, at the source measure's first
-    performance pass (pass_number == 1).  Volta brackets are written as
-    <ending> elements.
-
-    Returns
-    -------
-    ET.Element root of a valid MusicXML document ready for AlphaTab.
-    """
-
-
-def _beat_to_xml_notes(
-    beat     : list,           # list[NoteEvent], simultaneous
-    duration : tuple,          # (duration_value, note_type, dots) from ticks_to_musicxml_duration
-    tuning   : list[int],      # MIDI pitches per string, high→low
-    voice    : int = 1,
-) -> list[ET.Element]:
-    """
-    Convert one tab beat group into a list of MusicXML <note> elements.
-
-    The first note in the group is a regular note; subsequent notes carry
-    <chord/> so they sound simultaneously.  All share the same duration.
-    """
-
-
-def _add_technical(
-    note_el  : ET.Element,
-    ev       : object,         # NoteEvent
-) -> None:
-    """
-    Append <notations><technical> children to a <note> element from a
-    NoteEvent.  Handles: string, fret, fingering (LH), pluck (RH),
-    slide start/stop, hammer-on, pull-off, bend, vibrato, harmonic.
-    """
-```
+If a backward repeat exists but no forward repeat, `repeat_start` is
+automatically added to the first measure of the piece.
 
 ---
 
-## Orchestration (`main.py`)
+## `midi_timing.py`
 
-```
-txt → parse_txt()         →  TabFile
-                                │
-                          expand_repeats()   →  ExpandedScore
-                                │                    │
-mid → extract_timing()   →  TimingMap               │
-                                │                    │
-                          build_musicxml(expanded, timing)
-                                │
-                          annotated MusicXML (ET.Element)
-                                │
-                          write XML → output/musicxml/
-                                │
-                          generate_site()   →  output/site/
-```
+Uses `mido` (raw MIDI events, no MusicXML conversion) to produce a `TimingMap`.
 
----
+1. Reads all MIDI tracks; merges into a single event stream sorted by absolute tick.
+2. Builds a tempo map from `set_tempo` events.
+3. Identifies measure boundaries from `time_signature` events and ticks-per-measure.
+4. Within each measure, groups simultaneous `note_on` events (same tick) into
+   `BeatGroupTiming` objects.
+5. `duration_ticks` for each beat group = next group's onset − this group's onset
+   (or measure end for the last group).
 
-## How repeats solve the bar-count mismatch
+`midi_pitches` in each `BeatGroupTiming` are stored for cross-validation only —
+they are never used to override tab content.
 
-**El Negrito example** (0-indexed, written bars 0–80, 52 unique, 29 gap bars):
-
-```
-Written score:            Performance order after expand_repeats():
-bar 0  (pickup)       →   bar 0
-bars 1-16 (||: :||)   →   bars 1-16   (pass 1)
-                          bars 1-16   (pass 2)  ← gap bars 20-33 in tab numbering
-bars 17-18            →   bars 17-18
-bars 19-48 (||: :||)  →   bars 19-48  (pass 1)
-                          bars 19-48  (pass 2)  ← gap bars 49-63
-bars 64-80            →   bars 64-80
-```
-
-Expanded: 1 + 16 + 16 + 2 + 30 + 30 + 17 = **112 measures**
-MIDI non-empty: 80
-
-Hmm — still doesn't match.  This means El Negrito's MIDI does *not* play both
-repeats in full; it plays each section once.  The gap bars encode section-label
-offsets, not repeats.  `expand_repeats()` must detect this case and NOT double
-the sections; instead it uses the gap structure from `bar_count_info()` to
-determine how many passes the MIDI actually makes.
-
-This is why the gap-aware `bar_count_span` (81) ≈ MIDI (80) worked: the gaps
-ARE the repeated bars, not bars that need to be generated by expanding.  The
-tab numbering itself already encodes the full sequence; the gaps are just
-skipped labels for the second pass.
-
-**Corrected understanding:**
-
-The tab's measure-number gaps do *not* mean "these bars are absent from the
-tab"; they mean "the bar at position X in the performance corresponds to
-source bar Y".  The gap bar numbers are *aliases* for repeated source bars.
-
-`expand_repeats()` must therefore build a mapping:
-
-```
-gap_bar_number → source_bar_number
-```
-
-For El Negrito:
-- gap bars 20–33 → source bars 1–14  (repeat of section A, shifted by 19)
-- gap bars 49–63 → source bars 34–48 (repeat of section B, shifted by 15)
-
-This mapping is derivable from the `||:` and `:|` positions and the gap positions.
+`ticks_to_duration(ticks, divisions, time_sig_denom)` maps a tick count to the
+nearest standard note value: `(duration_value, note_type_str, n_dots)`.
 
 ---
 
-## Cross-validation (not matching)
+## `score_builder.py`
 
-`score_builder.py` can optionally compare its MIDI pitch set against the tab
-pitch set for each beat group — not to correct the tab, but to log discrepancies:
+### Measure alignment
 
-```python
-def _validate_beat(
-    tab_beat   : list,      # list[NoteEvent]
-    midi_beat  : BeatGroupTiming,
-    tuning     : list[int],
-    context    : str,       # "bar N beat M" for log messages
-) -> None:
-    """
-    Log a warning if the set of tab MIDI pitches differs materially from
-    the set of MIDI note-on pitches at this beat.
+`expanded.measures[i]` is paired with `timing.measures[i]` by sequential
+position — no pitch matching. When counts differ, the shorter list determines
+how many pairs are formed; surplus measures on either side are logged.
 
-    This never changes the output — it only logs to issues_log so the
-    transcriber can investigate.
-    """
+### Beat-group alignment
+
+Within each measure:
+
 ```
+tab_beats  = get_beats(expanded_measure.notes)   # grouped by col
+midi_beats = timing_measure.beat_groups           # grouped by onset tick
+```
+
+The two lists are zipped by position.
+
+- **Extra MIDI beats** (slide destinations, ornaments) → skipped.
+- **Extra tab beats** → duration estimated from remaining measure ticks divided
+  equally; logged as `timing_estimation`.
+
+### Slide duration merging
+
+A slide `4/7` in the tab is one beat, but the MIDI records two note-on events:
+one at the source pitch and one at the destination. Without correction the
+MIDI-index would shift, misaligning every subsequent beat.
+
+Fix: when a tab beat contains a slide with a known `slide_to`, and the next MIDI
+beat's pitches include the destination pitch (within ±1 semitone), the two MIDI
+durations are merged into the slide beat and the MIDI index advances by 2.
+
+### Technique destination synthesis
+
+Slides, hammer-ons, and pull-offs in the tab have `slide_to` set and no
+separate destination `NoteEvent` (the parser consumes the destination fret into
+`slide_to`). The score builder synthesises a destination note:
+
+```
+source note  →  duration × 2/3   (technique start annotation)
+dest note    →  duration × 1/3   (technique stop annotation)
+```
+
+Both notes are emitted into the same measure. If the destination note was
+already written explicitly in the tab (at the next beat, same string, correct
+fret), no synthesis occurs — the explicit note is annotated as a stop instead.
+
+Open-ended techniques (`slide_to=None`) emit only a start annotation; no
+destination note is synthesised.
+
+### `<slide>` XML placement
+
+`<slide>` is a **direct child of `<notations>`**, not inside `<technical>`.
+This is required by AlphaTab's MusicXML parser. `@line-type` is not included
+(not supported by AlphaTab). `@number="1"` is always set.
+
+`<hammer-on>` and `<pull-off>` remain inside `<technical>`, which is the
+MusicXML spec location and what AlphaTab expects.
+
+### Time signature handling
+
+- **First measure**: the tab header's `time_sig` (e.g. `"2/4"`) overrides the
+  MIDI default, which is almost always 4/4 regardless of actual metre.
+- **Mid-piece changes**: taken from `MeasureTiming.time_sig_num/denom` from MIDI
+  meta-events. A `<attributes><time>` block is emitted only when the time
+  signature changes relative to the preceding measure.
+- **Fallback measures** (when `n_exp > n_midi`): the last known MIDI time
+  signature is carried forward; `prev_time_sig` threading prevents redundant
+  `<time>` re-declarations.
+
+### Harmonic encoding
+
+| Tab notation | `harmonic` | `touch_fret` | MusicXML output |
+|---|---|---|---|
+| `<7>` (bracket) | True | None | `<harmonic><natural/>` inside `<technical>` |
+| `3[15]` (artificial) | True | 15 | `<harmonic><artificial/>` inside `<technical>` |
+| `Harm.` text | True (if fret ∈ {5,7,9,12,19,24}) | None | `<harmonic><natural/>` |
 
 ---
 
-## Migration path
+## Test suite
 
-1. Implement `midi_timing.py` — pure MIDI reader, no music21.
-2. Implement `repeat_expander.py` — expand + gap-alias mapping.
-3. Implement `score_builder.py` — build MusicXML from tab + timing.
-4. Update `main.py` to use the new pipeline.
-5. Keep `annotate_xml.py` and `convert_mid.py` as legacy fallbacks during
-   transition; deprecate once the new pipeline passes the test suite.
-6. Extend `TestXmlBarCountMatchesTab` to compare `len(expanded.measures)`
-   against MIDI measure count (should be near-exact after expansion).
+| Script | Scope | Sample |
+|--------|-------|--------|
+| `test_parsers.py` | Unit + integration (145 tests) | Fixed synthetic inputs |
+| `test_pipeline.py` | End-to-end XML correctness | 4 hand-validated reference pieces |
+| `test_harmonics_slides.py` | Harmonic + slide XML encoding | 300 pieces each |
+| `test_techniques.py` | Pull-off / hammer-on XML pairs, timing | 100 pieces, seed=7 |
+| `test_time_signatures.py` | Time sig parsing + mid-piece changes | 150 pieces, seeds 11 & 17 |
+
+`test_techniques.py` distinguishes open-ended techniques (`slide_to=None` —
+valid notation) from broken pairs (destination written but no matching stop in
+the XML). The real broken count is `max(0, unpaired − open_ended_count)`.
+
+Timing tolerance for technique-containing measures is 1.30× because destination
+synthesis adds up to 1/3 of the original beat duration.
+
+---
+
+## Known edge cases
+
+**Open-ended techniques** — `6\`, `1h-` without a destination fret. `slide_to`
+is `None`; the score builder emits only a start annotation. Not an error.
+
+**Bar-count mismatch after expansion** — Choros No. 1 and similar pieces have
+MIDI files that don't match the tab bar count even after expansion. The shorter
+list controls pairing; surplus measures from either side are logged and skipped.
+
+**MIDI measure 0 defaulting to 4/4** — very common. Overridden by the tab
+header's `time_sig` on the first measure.
+
+**`_TIME_RE` separator variants** — the time signature regex accepts `is` as a
+separator (`"The time signature is 2/4"`) in addition to `:`, `-`, and `–`.
