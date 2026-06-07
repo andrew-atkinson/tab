@@ -88,6 +88,10 @@ class PieceResult:
     xml_notes_total: int = 0
     xml_annotated: int = 0   # notes with string+fret
     gen_error: str = ''
+    # Bar-count validation (new pipeline)
+    expanded_measures: int = 0
+    midi_measures: int = 0
+    bar_count_delta: int = 0
     # Accuracy
     pitch_match: int = 0     # annotated notes where pitch ≈ expected
     pitch_total: int = 0
@@ -127,21 +131,26 @@ def run_piece(p: dict) -> PieceResult:
         res.parse_error = str(e)
         return res
 
-    # ── 2. Generate XML ──────────────────────────────────────────────────────
+    # ── 2. Generate XML (new tab-primary pipeline) ───────────────────────────
     import xml.etree.ElementTree as ET
     try:
-        from convert_mid import mid_to_musicxml
-        from annotate_xml import annotate
-        tmp_raw = tempfile.mktemp(suffix='.xml')
-        tmp_out = tempfile.mktemp(suffix='.xml')
-        mid_to_musicxml(mid_path, tmp_raw)
-        annotate(tmp_raw, tab, tmp_out)
-        os.remove(tmp_raw)
-        tree = ET.parse(tmp_out)
-        root = tree.getroot()
-        os.remove(tmp_out)
+        from repeat_expander import expand_repeats, expansion_summary
+        from midi_timing     import extract_timing
+        from score_builder   import build_musicxml
+
+        expanded = expand_repeats(tab)
+        timing   = extract_timing(mid_path)
+
+        # Bar-count validation: expanded score should closely match MIDI
+        n_expanded = len(expanded.measures)
+        n_midi     = len(timing.measures)
+        res.expanded_measures = n_expanded
+        res.midi_measures     = n_midi
+        res.bar_count_delta   = n_expanded - n_midi
+
+        root = build_musicxml(expanded, timing)
     except Exception as e:
-        res.gen_error = traceback.format_exc()[-300:]
+        res.gen_error = traceback.format_exc()[-400:]
         return res
 
     parts = root.findall('.//part')
@@ -263,6 +272,9 @@ def print_result(res: PieceResult):
         print(f'\n  ❌ XML GEN ERROR:\n{res.gen_error}')
         return
     print(f'\n  ── XML generation ──────────────────────────────────────')
+    bar_ok = '✓' if abs(res.bar_count_delta) <= 2 else '✗'
+    print(f'  Expanded measures: {res.expanded_measures}  MIDI measures: {res.midi_measures}  '
+          f'delta: {res.bar_count_delta:+d}  {bar_ok}')
     print(f'  XML parts        : {res.xml_parts}')
     print(f'  XML notes total  : {res.xml_notes_total}')
     print(f'  Annotated        : {res.xml_annotated}  ({pct(res.xml_annotated, res.xml_notes_total)} of XML notes)')
@@ -300,17 +312,21 @@ def main():
     print(f'\n{"━"*72}')
     print('SUMMARY')
     print(f'{"━"*72}')
-    print(f'{"Piece":<35} {"Systems":>7} {"Meas":>5} {"Notes":>6} {"Pitch%":>7} {"Chord%":>7}')
-    print('─' * 72)
+    print(f'{"Piece":<35} {"Systems":>7} {"Meas":>5} {"Notes":>6} {"Exp":>5} {"MIDI":>5} {"Δ":>4} {"Pitch%":>7} {"Chord%":>7}')
+    print('─' * 80)
     for r in results:
         if r.parse_error or r.gen_error:
             status = 'FAILED'
             print(f'{r.name:<35} {status}')
         else:
+            delta_str = f'{r.bar_count_delta:+d}'
             print(f'{r.name:<35} '
                   f'{r.systems_found:>7} '
                   f'{r.measures_parsed:>5} '
                   f'{r.tab_notes_total:>6} '
+                  f'{r.expanded_measures:>5} '
+                  f'{r.midi_measures:>5} '
+                  f'{delta_str:>4} '
                   f'{pct(r.pitch_match, r.pitch_total):>7} '
                   f'{pct(r.chord_correct, r.chord_total):>7}')
     print()

@@ -51,6 +51,13 @@ def _process_one(args: tuple) -> tuple[str, bool, str]:
     """
     Worker function.  Returns (stem, success, message).
     Importing here so the worker process doesn't re-import unnecessarily.
+
+    Pipeline (tab-primary architecture):
+      txt  → parse()          → TabFile
+      tab  → expand_repeats() → ExpandedScore
+      mid  → extract_timing() → TimingMap
+      (expanded, timing) → build_musicxml() → ET.Element
+      root → write_musicxml() → out_xml_path
     """
     mid_path, txt_path, out_xml_path, force = args
 
@@ -61,24 +68,26 @@ def _process_one(args: tuple) -> tuple[str, bool, str]:
         return stem, True, 'skipped (already exists)'
 
     try:
-        from convert_mid import mid_to_musicxml
-        from parse_txt   import parse
-        from annotate_xml import annotate
+        import xml.etree.ElementTree as ET
+        from parse_txt        import parse
+        from repeat_expander  import expand_repeats
+        from midi_timing      import extract_timing
+        from score_builder    import build_musicxml, write_musicxml
 
-        # 1. MIDI → raw MusicXML (write to /tmp to avoid filesystem permission issues)
-        import tempfile
-        tmp_xml = os.path.join(tempfile.gettempdir(), Path(out_xml_path).stem + '.tmp.xml')
-        mid_to_musicxml(mid_path, tmp_xml)
-
-        # 2. Parse the .txt
+        # 1. Parse the .txt tab (source of truth)
         tab = parse(txt_path)
 
-        # 3. Annotate
-        annotate(tmp_xml, tab, out_xml_path)
+        # 2. Expand repeats → performance order
+        expanded = expand_repeats(tab)
 
-        # Clean up temp
-        if Path(tmp_xml).exists():
-            os.remove(tmp_xml)
+        # 3. Extract beat-group timing from the MIDI (timing oracle only)
+        timing = extract_timing(mid_path)
+
+        # 4. Build annotated MusicXML from tab + timing
+        root = build_musicxml(expanded, timing, stem=stem)
+
+        # 5. Write to disk
+        write_musicxml(root, out_xml_path)
 
         return stem, True, 'ok'
 

@@ -373,7 +373,7 @@ def find_chords_fingering(lines: list[str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 _KEY_RE   = re.compile(r'key(?:\s*sig(?:nature)?)?\s*[:\-–]?\s+([^\n,\t\d]{1,20}?)(?:\s{2,}|\t|\n|$)', re.IGNORECASE | re.MULTILINE)
-_TIME_RE  = re.compile(r'time(?:\s*sig(?:nature)?)?\s*[:\-–]?\s+(\d+/\d+)', re.IGNORECASE | re.MULTILINE)
+_TIME_RE  = re.compile(r'time(?:\s*sig(?:nature)?)?\s*(?:is\s*|[:\-–]\s*)?(\d+/\d+)', re.IGNORECASE | re.MULTILINE)
 _TEMPO_RE = re.compile(r'tempo\s*[:\-–]?\s+(\d+)\s*(?:bpm)?(?:\s*[-–]\s*(\d+)\s*(?:bpm)?)?(?:\s*\(([^)]+)\))?', re.IGNORECASE | re.MULTILINE)
 _CAPO_RE  = re.compile(r'capo\s*[:\-–]?\s*(\d+)', re.IGNORECASE)
 

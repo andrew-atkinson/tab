@@ -1746,6 +1746,307 @@ class TestXmlBarCountMatchesTab(unittest.TestCase):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# New pipeline: midi_timing, repeat_expander, score_builder
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMidiTiming(unittest.TestCase):
+    """Tests for midi_timing.extract_timing() and ticks_to_duration()."""
+
+    @classmethod
+    def setUpClass(cls):
+        import warnings
+        warnings.filterwarnings('ignore')
+
+    def _tm(self, stem):
+        from midi_timing import extract_timing
+        p = CLASSTAB / (stem + '.mid')
+        if not p.exists():
+            self.skipTest(f'{stem}.mid not found')
+        return extract_timing(str(p))
+
+    # ── El Negrito (3/4, 192 tpb) ────────────────────────────────────────────
+
+    def test_el_negrito_measure_count(self):
+        """El Negrito MIDI should produce exactly 81 non-empty measures."""
+        tm = self._tm('lauro_two_venezuelan_waltzes_1_el_negrito')
+        non_empty = sum(1 for m in tm.measures if m.beat_groups)
+        self.assertEqual(non_empty, 81,
+            f'Expected 81 non-empty measures, got {non_empty}')
+
+    def test_el_negrito_time_sig(self):
+        """El Negrito is in 3/4."""
+        tm = self._tm('lauro_two_venezuelan_waltzes_1_el_negrito')
+        # Check a typical full measure (not the pickup)
+        full = next(m for m in tm.measures if m.beat_groups)
+        self.assertEqual(full.time_sig_denom, 4)
+
+    def test_el_negrito_tempo(self):
+        """El Negrito tempo is 132 BPM."""
+        tm = self._tm('lauro_two_venezuelan_waltzes_1_el_negrito')
+        # After the first set_tempo event
+        bpms = {round(m.tempo_bpm) for m in tm.measures if m.beat_groups}
+        self.assertIn(132, bpms, f'Expected 132 BPM, found {bpms}')
+
+    def test_beat_groups_have_pitches(self):
+        """Every non-empty beat group must have at least one MIDI pitch."""
+        tm = self._tm('lauro_two_venezuelan_waltzes_1_el_negrito')
+        for m in tm.measures:
+            for bg in m.beat_groups:
+                self.assertTrue(bg.midi_pitches,
+                    f'Beat group at offset {bg.onset_ticks} has no pitches')
+
+    def test_beat_group_durations_positive(self):
+        """All beat-group durations must be positive."""
+        tm = self._tm('lauro_two_venezuelan_waltzes_1_el_negrito')
+        for m in tm.measures:
+            for bg in m.beat_groups:
+                self.assertGreater(bg.duration_ticks, 0,
+                    f'Non-positive duration {bg.duration_ticks} at offset '
+                    f'{bg.onset_ticks} in measure {m.measure_idx}')
+
+    # ── Choros No.1 (2/4, 192 tpb) ───────────────────────────────────────────
+
+    def test_choros_time_sig(self):
+        """Choros No.1 is in 2/4."""
+        tm = self._tm('villa-lobos_choros_01')
+        m1 = tm.measures[1]
+        self.assertEqual(m1.time_sig_num,   2)
+        self.assertEqual(m1.time_sig_denom, 4)
+
+    def test_choros_tempo_88(self):
+        """Choros No.1 tempo is 88 BPM."""
+        tm = self._tm('villa-lobos_choros_01')
+        bpms = {round(m.tempo_bpm) for m in tm.measures if m.beat_groups}
+        self.assertIn(88, bpms)
+
+    # ── ticks_to_duration ─────────────────────────────────────────────────────
+
+    def test_quarter_note(self):
+        from midi_timing import ticks_to_duration
+        dur, ntype, dots = ticks_to_duration(192, 192)
+        self.assertEqual(ntype, 'quarter')
+        self.assertEqual(dots, 0)
+
+    def test_eighth_note(self):
+        from midi_timing import ticks_to_duration
+        dur, ntype, dots = ticks_to_duration(96, 192)
+        self.assertEqual(ntype, 'eighth')
+
+    def test_dotted_quarter(self):
+        from midi_timing import ticks_to_duration
+        # 192 + 96 = 288 ticks = dotted quarter at 192 tpb
+        dur, ntype, dots = ticks_to_duration(288, 192)
+        self.assertEqual(ntype, 'quarter')
+        self.assertEqual(dots, 1)
+
+    def test_half_note(self):
+        from midi_timing import ticks_to_duration
+        dur, ntype, dots = ticks_to_duration(384, 192)
+        self.assertEqual(ntype, 'half')
+
+
+class TestRepeatExpander(unittest.TestCase):
+    """Tests for repeat_expander.expand_repeats() and build_gap_alias_map()."""
+
+    def _tab(self, stem):
+        import warnings; warnings.filterwarnings('ignore')
+        from parse_txt import parse
+        p = CLASSTAB / (stem + '.txt')
+        if not p.exists():
+            self.skipTest(f'{stem}.txt not found')
+        return parse(str(p))
+
+    # ── Gap alias map ─────────────────────────────────────────────────────────
+
+    def test_alias_map_empty_for_no_gaps(self):
+        from repeat_expander import build_gap_alias_map
+        from models import MeasureData
+        m = {k: MeasureData(number=k) for k in range(1, 11)}
+        self.assertEqual(build_gap_alias_map(m), {})
+
+    def test_alias_map_el_negrito(self):
+        """El Negrito must have 29 gap aliases covering bars 20-33 and 49-63."""
+        from repeat_expander import build_gap_alias_map
+        tab   = self._tab('lauro_two_venezuelan_waltzes_1_el_negrito')
+        alias = build_gap_alias_map(tab.measures)
+        self.assertEqual(len(alias), 29,
+            f'Expected 29 gap aliases, got {len(alias)}: {alias}')
+        # All aliases must point to written bars
+        for gap, src in alias.items():
+            self.assertIn(src, tab.measures,
+                f'Gap {gap} → {src} but {src} is not a written bar')
+
+    # ── Gap-encoded expansion ────────────────────────────────────────────────
+
+    def test_el_negrito_expansion_matches_midi(self):
+        """
+        Gap-encoded expansion of El Negrito must produce exactly 81 measures,
+        matching the MIDI's non-empty measure count.
+        """
+        from repeat_expander import expand_repeats
+        from midi_timing import extract_timing
+        tab = self._tab('lauro_two_venezuelan_waltzes_1_el_negrito')
+        exp = expand_repeats(tab)
+        tm  = extract_timing(str(CLASSTAB / 'lauro_two_venezuelan_waltzes_1_el_negrito.mid'))
+        midi_ne = sum(1 for m in tm.measures if m.beat_groups)
+        self.assertEqual(len(exp.measures), midi_ne,
+            f'Expanded {len(exp.measures)} ≠ MIDI {midi_ne}')
+
+    def test_el_negrito_pass_numbers(self):
+        """Repeated bars must have pass_number=2; first-time bars pass_number=1."""
+        from repeat_expander import expand_repeats
+        tab = self._tab('lauro_two_venezuelan_waltzes_1_el_negrito')
+        exp = expand_repeats(tab)
+        passes = {m.pass_number for m in exp.measures}
+        self.assertIn(1, passes, 'No first-pass measures found')
+        self.assertIn(2, passes, 'No repeated (pass 2) measures found')
+
+    def test_all_sources_are_written_bars(self):
+        """Every ExpandedMeasure.source_num must point to a written bar."""
+        from repeat_expander import expand_repeats
+        tab = self._tab('lauro_two_venezuelan_waltzes_1_el_negrito')
+        exp = expand_repeats(tab)
+        for em in exp.measures:
+            self.assertIn(em.source_num, tab.measures,
+                f'source_num {em.source_num} is not a written bar')
+
+    # ── Sign-encoded expansion ───────────────────────────────────────────────
+
+    def test_sign_encoded_length_gt_written(self):
+        """Sign-encoded expansion of Barrios must exceed the written count."""
+        from repeat_expander import expand_repeats
+        tab = self._tab('barrios_un_sueno_en_la_floresta')
+        exp = expand_repeats(tab)
+        self.assertGreater(len(exp.measures), len(tab.measures),
+            'Sign-encoded expansion must be longer than the written score')
+
+    def test_cardoso_zero_indexed_no_gaps(self):
+        """Cardoso (0-indexed, no gaps) expands to the same count as written."""
+        from repeat_expander import expand_repeats
+        from midi_timing import extract_timing
+        tab = self._tab('cardoso_suite_sudamericana_09_aire_de_milonga')
+        exp = expand_repeats(tab)
+        tm  = extract_timing(str(
+            CLASSTAB / 'cardoso_suite_sudamericana_09_aire_de_milonga.mid'))
+        midi_ne = sum(1 for m in tm.measures if m.beat_groups)
+        # Cardoso should be within 1 of MIDI (pickup bar tolerance)
+        self.assertAlmostEqual(len(exp.measures), midi_ne, delta=1,
+            msg=f'Expanded={len(exp.measures)} MIDI={midi_ne}')
+
+
+class TestScoreBuilder(unittest.TestCase):
+    """Integration tests for score_builder.build_musicxml()."""
+
+    @classmethod
+    def setUpClass(cls):
+        import warnings, tempfile, os
+        warnings.filterwarnings('ignore')
+        import xml.etree.ElementTree as ET
+        from parse_txt import parse
+        from repeat_expander import expand_repeats
+        from midi_timing import extract_timing
+        from score_builder import build_musicxml
+
+        txt = CLASSTAB / 'lauro_two_venezuelan_waltzes_1_el_negrito.txt'
+        mid = CLASSTAB / 'lauro_two_venezuelan_waltzes_1_el_negrito.mid'
+        if not txt.exists() or not mid.exists():
+            cls._skip = True
+            return
+        cls._skip = False
+
+        tab = parse(str(txt))
+        exp = expand_repeats(tab)
+        tm  = extract_timing(str(mid))
+        cls._root = build_musicxml(exp, tm, stem='lauro_two_venezuelan_waltzes_1_el_negrito')
+        cls._part = cls._root.find('.//part')
+
+    def setUp(self):
+        if self._skip:
+            self.skipTest('El Negrito files not found')
+
+    def test_correct_measure_count(self):
+        """Built score must have 81 measures (= MIDI measure count)."""
+        measures = self._part.findall('measure')
+        self.assertEqual(len(measures), 81)
+
+    def test_first_note_has_pitch(self):
+        """Every <note> must have a <pitch> child."""
+        for note in self._root.findall('.//note'):
+            if note.find('rest') is not None:
+                continue
+            self.assertIsNotNone(note.find('pitch'),
+                'Note without <pitch> element')
+
+    def test_all_notes_have_string_and_fret(self):
+        """Every pitched note must carry <string> and <fret> in <technical>."""
+        for note in self._root.findall('.//note'):
+            if note.find('rest') is not None:
+                continue
+            self.assertIsNotNone(note.find('.//string'),
+                f'Note missing <string>: {ET.tostring(note, encoding="unicode")[:80]}')
+            self.assertIsNotNone(note.find('.//fret'),
+                f'Note missing <fret>: {ET.tostring(note, encoding="unicode")[:80]}')
+
+    def test_all_notes_have_duration(self):
+        """All notes must have a positive <duration>."""
+        for note in self._root.findall('.//note'):
+            dur_text = note.findtext('duration')
+            self.assertIsNotNone(dur_text, 'Note missing <duration>')
+            self.assertGreater(int(dur_text), 0, f'Zero duration on note')
+
+    def test_string_numbers_in_range(self):
+        """All <string> values must be 1–6."""
+        for s_el in self._root.findall('.//string'):
+            v = int(s_el.text)
+            self.assertGreaterEqual(v, 1, f'String {v} < 1')
+            self.assertLessEqual(v, 6, f'String {v} > 6')
+
+    def test_fret_numbers_non_negative(self):
+        """All <fret> values must be ≥ 0."""
+        for f_el in self._root.findall('.//fret'):
+            self.assertGreaterEqual(int(f_el.text), 0,
+                f'Negative fret: {f_el.text}')
+
+    def test_no_duplicate_strings_in_chord(self):
+        """Within each chord group, no two notes may share a string number."""
+        import xml.etree.ElementTree as ET
+        for meas in self._part.findall('measure'):
+            # Group notes into chord clusters
+            clusters: list[list[ET.Element]] = []
+            for note in meas.findall('note'):
+                if note.find('rest') is not None:
+                    continue
+                if note.find('chord') is not None and clusters:
+                    clusters[-1].append(note)
+                else:
+                    clusters.append([note])
+            for cluster in clusters:
+                strings = [int(n.findtext('.//string', '0')) for n in cluster]
+                dups = [s for s in set(strings) if strings.count(s) > 1]
+                self.assertEqual(dups, [],
+                    f'Measure {meas.get("number")}: duplicate strings {dups}')
+
+    def test_tempo_direction_present(self):
+        """First measure must contain a metronome direction."""
+        first = self._part.findall('measure')[0]
+        metronome = first.find('.//metronome')
+        self.assertIsNotNone(metronome, 'No metronome direction in first measure')
+        per_minute = first.findtext('.//per-minute')
+        self.assertIsNotNone(per_minute)
+        self.assertGreater(int(per_minute), 0)
+
+    def test_staff_tuning_present(self):
+        """First measure must have <staff-details> with 6 <staff-tuning> lines."""
+        first = self._part.findall('measure')[0]
+        tunings = first.findall('.//staff-tuning')
+        self.assertEqual(len(tunings), 6,
+            f'Expected 6 staff-tuning elements, got {len(tunings)}')
+
+
+import xml.etree.ElementTree as ET   # needed by TestScoreBuilder
+
+
 class TestChoros01SlideAnnotation(unittest.TestCase):
     """
     Integration tests verifying the full annotate_xml pipeline on Choros

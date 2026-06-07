@@ -99,7 +99,9 @@ _STRING_LINE_RE = re.compile(
     r'|^\s*[a-gA-G][#b]?-+'              # B:        letter[#b] + 1+ dashes
     r'|^\s*\|\|[-0-9]'                   # C:        ||-- or ||digit
     r'|^\s*\|[-0-9]'                     # D:        |-- or |digit
-    r'|^\s*-+[-0-9|/\\hpb~=<>*.]*\|'    # E/F:      dash(es)…barline
+    r'|^\s*-+[-0-9|/\\hpb~=<>*.a-z]*\|' # E/F:      dash(es)…barline
+    # lowercase letters cover technique chars (h,p,b) and rest notation
+    # (r/e/s/t written vertically) without matching barre/annotation lines
 )
 
 _MNUM_STRICT_RE = re.compile(r'^\s*\d+\s+[|.$]|^\s*\d+\s*$')
@@ -292,7 +294,12 @@ def _first_measure_number(mnum_line: Optional[str]) -> Optional[int]:
 # Note extraction (tuning-aware)
 # ---------------------------------------------------------------------------
 
-_HARMONIC_RE = re.compile(r'<(\d{1,2})>')
+_HARMONIC_RE  = re.compile(r'<(\d{1,2})>')          # natural harmonic node: <7>
+_ART_HARM_RE  = re.compile(r'(\d+)\[(\d{1,2})\]')   # artificial harmonic:   3[15]
+_HARM_ANNOT_RE = re.compile(                         # Harm. text on annotation lines
+    r'nat\.?\s*harm\.?|(?<![a-zA-Z])harm\.?|\(harm\)',
+    re.IGNORECASE,
+)
 
 _TECH_MAP = {
     '/':  'slide_up',
@@ -329,7 +336,7 @@ def extract_notes(
     while pos < len(cell):
         ch = cell[pos]
 
-        # Harmonic <7>
+        # Natural harmonic node: <7>
         hm = _HARMONIC_RE.match(cell, pos)
         if hm:
             fret = int(hm.group(1))
@@ -343,6 +350,23 @@ def extract_notes(
             pos = hm.end()
             continue
 
+        # Artificial harmonic: 3[15]  (left-hand fret[touch fret])
+        ah = _ART_HARM_RE.match(cell, pos)
+        if ah:
+            fret       = int(ah.group(1))   # left-hand fret position
+            touch_fret = int(ah.group(2))   # right-hand touch point
+            # Sounding pitch is at the touch fret (open + touch_fret semitones)
+            midi = note_midi(string_num, touch_fret, tuning_midi)
+            events.append(NoteEvent(
+                string=string_num, fret=fret,
+                col=col_offset + pos,
+                harmonic=True, touch_fret=touch_fret,
+                triplet=inside_triplet,
+                open_note=open_note, midi_pitch=midi,
+            ))
+            pos = ah.end()
+            continue
+
         if ch.isdigit():
             j = pos + 1
             while j < len(cell) and cell[j].isdigit():
@@ -352,18 +376,26 @@ def extract_notes(
             technique = _TECH_MAP.get(tech_ch)
             post = j + (1 if technique else 0)
 
-            # Slide notation: 1/5 or 7\5 — the digit(s) after the technique
-            # character are the *destination* fret, not a separately struck note.
-            # Consume them and store as slide_to so they don't become a phantom
-            # NoteEvent on the next iteration.
+            # Technique destination: 1/5  7\5  5p0  5h8  3p--2  4h-5
+            # For slides, hammer-ons, and pull-offs the digit(s) after the
+            # technique character are the *destination* fret — not a separately
+            # struck note.  Transcribers sometimes insert dashes between the
+            # technique character and the destination fret (e.g. "3p--2") to
+            # align beats visually; skip those dashes before reading digits.
+            # Consume everything into slide_to so no phantom NoteEvent is created.
             slide_to: int | None = None
-            if technique in ('slide_up', 'slide_down'):
+            if technique in ('slide_up', 'slide_down', 'hammer', 'pull'):
                 k = post
-                while k < len(cell) and cell[k].isdigit():
+                while k < len(cell) and cell[k] == '-':   # skip inter-beat dashes
                     k += 1
-                if k > post:
-                    slide_to = int(cell[post:k])
-                    post = k   # skip past the destination fret
+                m = k
+                while m < len(cell) and cell[m].isdigit():
+                    m += 1
+                if m > k:
+                    slide_to = int(cell[k:m])
+                    post = m   # skip past the destination fret
+                # (if no digit found after dashes, slide_to stays None —
+                #  technique written without a destination, e.g. bare "h")
 
             tied = post < len(cell) and cell[post] == '='
             midi = note_midi(string_num, fret, tuning_midi)
@@ -449,6 +481,34 @@ def assign_rh_fingering(notes: list[NoteEvent], pima_line: Optional[str]) -> Non
 # ---------------------------------------------------------------------------
 
 _VOLTA_RE = re.compile(r'(\d)_{3,}')
+
+
+def find_harm_spans(line: str, col_start: int, col_end: int) -> list[tuple[int, int]]:
+    """
+    Return (span_start, span_end) pairs for 'Harm.' / 'nat.harm.' / '(Harm)'
+    annotations found within *line[col_start:col_end]*.
+
+    A note at column *c* is considered harmonic if:
+        span_start - HARM_COL_TOLERANCE <= c <= span_end + HARM_COL_TOLERANCE
+
+    Using a span (not just a start position) means the annotation text itself
+    can be several characters wide, and the note merely needs to overlap it —
+    avoiding false positives on notes that precede the annotation by several
+    columns.
+    """
+    seg = line[col_start:col_end] if col_end <= len(line) else line[col_start:]
+    return [(col_start + m.start(), col_start + m.end()) for m in _HARM_ANNOT_RE.finditer(seg)]
+
+
+# A note is harmonic if its column falls within this many columns of the
+# annotation *span* (not just the start character).  A tight value (2) avoids
+# tagging notes that merely appear in the same beat cell as the annotation.
+HARM_COL_TOLERANCE = 2
+
+# Natural harmonic nodes on guitar.  Text-annotation detection ('Harm.',
+# 'nat.harm.', '(Harm)') is restricted to these frets; explicit angle-bracket
+# notation (<7>) is accepted at any fret and is handled separately.
+_NATURAL_HARM_FRETS: frozenset[int] = frozenset({5, 7, 9, 12, 19, 24})
 
 
 def detect_repeat_volta(
@@ -610,6 +670,15 @@ def parse_tab(lines: list[str], tuning_str: str = "EADGBE") -> dict[int, Measure
         barre_line   = lines[barre_idx] if barre_idx is not None else None
         pima_line    = lines[pima_idx]  if pima_idx  is not None else None
 
+        # Collect all annotation lines above the string block (non-string, non-empty)
+        # that may carry 'Harm.' / '(Harm)' / 'nat.harm.' text.
+        first_str_idx = string_idxs[0]
+        annot_lines: list[str] = []
+        for k in range(max(0, first_str_idx - 6), first_str_idx):
+            ln = lines[k]
+            if ln.strip() and not _STRING_LINE_RE.match(ln):
+                annot_lines.append(ln)
+
         explicit_mnum = _first_measure_number(mnum_line)
         if explicit_mnum is not None:
             first_mnum       = explicit_mnum
@@ -653,6 +722,25 @@ def parse_tab(lines: list[str], tuning_str: str = "EADGBE") -> dict[int, Measure
 
             assign_lh_fingering(all_notes, finger_lines)
             assign_rh_fingering(all_notes, pima_line)
+
+            # Mark notes as harmonic when a 'Harm.' annotation appears on the
+            # measure-number line or any annotation line above the string block,
+            # overlapping the note's column within HARM_COL_TOLERANCE.
+            # Only notes at natural-harmonic fret positions are eligible (frets
+            # 5, 7, 9, 12, 19, 24); this prevents pull-off/slide bass notes
+            # that happen to sit near the annotation text from being mislabelled.
+            harm_spans: list[tuple[int, int]] = []
+            for aline in annot_lines:
+                harm_spans.extend(find_harm_spans(aline, col_start, col_end))
+            if harm_spans:
+                for note in all_notes:
+                    if note.fret not in _NATURAL_HARM_FRETS:
+                        continue
+                    if any(
+                        (hs - HARM_COL_TOLERANCE) <= note.col <= (he + HARM_COL_TOLERANCE)
+                        for hs, he in harm_spans
+                    ):
+                        note.harmonic = True
 
             md.notes.extend(all_notes)
 
