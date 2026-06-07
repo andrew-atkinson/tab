@@ -34,17 +34,21 @@ The contents of `tab/` are listed in `.gitignore` and will not be committed.
 tab/                    ← root of the repo (same name as the source folder)
 ├── tab/                Source files — .txt and .mid pairs (contents git-ignored)
 ├── pipeline/           Processing code
-│   ├── models.py           Shared data classes (NoteEvent, MeasureData, …)
-│   ├── topmatter_parser.py Header parsing: tuning, title, composer, transcriber, chords
-│   ├── tab_parser.py       Tab-body parsing: systems, beats, fingering, notes
-│   ├── bottom_parser.py    Footer parsing: legend, dynamics, biographical info
-│   ├── parse_txt.py        Main entry point – ties the three parsers together
-│   ├── convert_mid.py      MIDI → raw MusicXML  (via music21)
-│   ├── annotate_xml.py     Merges tab annotations into the raw MusicXML
-│   ├── generate_site.py    Builds the static AlphaTab website
-│   ├── main.py             CLI orchestrator for the full pipeline
-│   ├── test_parsers.py     Unit & integration test suite (145 tests)
-│   └── test_pipeline.py    End-to-end pipeline validation (4 reference pieces)
+│   ├── models.py                 Shared data classes (NoteEvent, MeasureData, …)
+│   ├── topmatter_parser.py       Header parsing: tuning, title, composer, transcriber, chords
+│   ├── tab_parser.py             Tab-body parsing: systems, beats, fingering, notes
+│   ├── bottom_parser.py          Footer parsing: legend, dynamics, biographical info
+│   ├── parse_txt.py              Ties the three parsers together → TabFile
+│   ├── repeat_expander.py        Expands repeats/voltas → ExpandedScore
+│   ├── midi_timing.py            Extracts per-measure timing from .mid → TimingMap
+│   ├── score_builder.py          Builds annotated MusicXML from TabFile + TimingMap
+│   ├── generate_site.py          Builds the static AlphaTab website
+│   ├── main.py                   CLI orchestrator for the full pipeline
+│   ├── test_parsers.py           Unit & integration test suite (145 tests)
+│   ├── test_pipeline.py          End-to-end pipeline validation (4 reference pieces)
+│   ├── test_harmonics_slides.py  Corpus test: harmonic and slide encoding (300 pieces)
+│   ├── test_techniques.py        Corpus test: pull-off/hammer-on XML pairs (100 pieces)
+│   └── test_time_signatures.py   Corpus test: time signature parsing and changes
 ├── output/             Generated files (git-ignored)
 │   ├── musicxml/           Annotated .xml files
 │   └── site/               Static website
@@ -58,28 +62,29 @@ tab/                    ← root of the repo (same name as the source folder)
 ## How the pipeline works
 
 ```
-tab/*.txt ──┐
-            ├──► parse_txt.py ──► TabFile (metadata + measures + notes)
-tab/*.mid ──┘         │
-                      │
-convert_mid.py ───────┤
-  MIDI → raw MusicXML │
-                      ▼
-               annotate_xml.py
-                 • Merges MIDI parts beat-by-beat
-                 • Assigns string, fret, fingering to each note
-                 • Adds tuning, capo, barres, repeats
-                      │
-                      ▼
-               output/musicxml/*.xml   (annotated MusicXML)
-                      │
-                      ▼
-               generate_site.py
-                 • One HTML page per piece
-                 • AlphaTab renders notation + TAB
-                      │
-                      ▼
-               output/site/index.html  (searchable library)
+tab/*.txt ──► parse_txt.py ──────► TabFile (metadata + measures + notes)
+                                        │
+                                   repeat_expander.py
+                                        │ ExpandedScore
+                                        │
+tab/*.mid ──► midi_timing.py ──► TimingMap
+                                        │
+                                   score_builder.py
+                                     • Lays out measures from tab
+                                     • Uses MIDI only for note durations
+                                     • Encodes techniques, harmonics,
+                                       barres, repeats, fingering
+                                        │
+                                        ▼
+                               output/musicxml/*.xml   (annotated MusicXML)
+                                        │
+                                        ▼
+                               generate_site.py
+                                 • One HTML page per piece
+                                 • AlphaTab renders notation + TAB
+                                        │
+                                        ▼
+                               output/site/index.html  (searchable library)
 ```
 
 ### Parser modules
@@ -115,11 +120,19 @@ convert_mid.py ───────┤
 | `find_dynamics()` | Dynamic markings (pp, mf, f, cresc, …) |
 | `find_biographical()` | Composer bio paragraphs |
 
-### Annotation (`annotate_xml.py`)
+### Score builder (`score_builder.py`)
 
-The key challenge is that guitar MIDI files are often multi-track. `_merge_parts` collects all pitched notes from every MIDI part with their true beat offsets, sorts them by offset (Part-0 notes first at ties), and rebuilds each measure as a single-voice sequence. Note durations are truncated to the gap until the next note onset so that sequentially placed notes land at the correct beat without overlapping.
+The pipeline is **tab-primary**: the `.txt` file is the single source of truth for pitches, fingering, and techniques. The `.mid` file is used only as a clock — it supplies the duration (in MIDI ticks) of each beat group so that the generated MusicXML has correct note values.
 
-Note matching uses a global sequential algorithm with a 4-note lookahead: XML notes (from the MIDI) are matched 1-to-1 with tab notes ordered by `(measure, col, string)`, verified by MIDI pitch within ±2 semitones. Unmatched notes fall back to a pitch-only string/fret guess.
+`midi_timing.py` reads raw MIDI events with `mido` (no MusicXML conversion) and returns a `TimingMap`: one `MeasureTiming` entry per measure, carrying ticks-per-division, time signature numerator/denominator, and a list of `BeatGroupTiming` objects that map beat-group onset → duration in ticks.
+
+`score_builder.py` drives the build:
+
+- `repeat_expander.py` expands all repeat signs and volta brackets into a flat `ExpandedScore` so that every written-out measure maps 1-to-1 with a MIDI measure.
+- For each measure, note durations are derived from the MIDI timing; chords (simultaneous beats) are handled with `<chord>` elements.
+- Technique notes (slides, pull-offs, hammer-ons) synthesize a destination note at the target fret with a 2:1 duration split between source and destination.
+- `<slide>` elements are placed directly in `<notations>` (not inside `<technical>`) to comply with AlphaTab's MusicXML parser.
+- The time signature for measure 1 is taken from the tab header (`time_sig` field) when present, overriding the MIDI default which is almost always 4/4. Mid-piece time signature changes come from MIDI meta-messages and are emitted as `<attributes><time>` blocks only on actual changes.
 
 ---
 
@@ -128,7 +141,7 @@ Note matching uses a global sequential algorithm with a 4-note lookahead: XML no
 ### Requirements
 
 - Python 3.10 or later
-- One external library: [music21](https://web.mit.edu/music21/)
+- External libraries: [mido](https://mido.readthedocs.io) (MIDI parsing) — declared in `pyproject.toml` and installed automatically by `pip install -e .`
 
 ### Recommended: virtual environment
 
@@ -175,7 +188,8 @@ tab-pipeline \
     --limit   50      \  # first N files, alphabetically    [all]
     --pieces          \  # only the 4 validated reference pieces (see below)
     --force           \  # reprocess even if output exists
-    --no-site            # skip site generation (conversion only)
+    --no-site         \  # skip site generation (conversion only)
+    --site-only          # skip conversion; regenerate site from existing XML
 ```
 
 `--limit` and `--pieces` are mutually exclusive selection modes:
@@ -252,6 +266,11 @@ python pipeline/test_parsers.py
 
 # End-to-end pipeline validation (4 reference pieces)
 python pipeline/test_pipeline.py
+
+# Corpus tests (require the full tab/ library)
+python pipeline/test_harmonics_slides.py   # harmonic + slide XML encoding (300 pieces each)
+python pipeline/test_techniques.py         # pull-off / hammer-on XML pairs (100 pieces)
+python pipeline/test_time_signatures.py    # time signature parsing and mid-piece changes
 ```
 
 `test_parsers.py` has 145 tests organised into:
@@ -314,7 +333,7 @@ The parser handles every format variant found across the classtab.org library:
 Additional features parsed:
 
 - **Barre markers**: Roman (`CII`, `cIV`) and Arabic (`C5`, `c7`)
-- **Harmonics**: `<7>` → `NoteEvent.harmonic = True`
+- **Harmonics**: `<7>` (bracket) → `NoteEvent.harmonic = True`; `Harm.` / `nat.harm.` text annotations detected via span matching; artificial harmonics set `touch_fret`
 - **Repeats**: `*|` `|*` `||:` `:|` → `repeat_start` / `repeat_end` on `MeasureData`
 - **Volta brackets**: `1____` patterns in measure-number lines
 - **Triplets**: `|-3-|` → `NoteEvent.triplet = True`
@@ -368,6 +387,8 @@ TabFile
 │           ├── finger       left-hand 1–4
 │           ├── rh_finger    right-hand p/i/m/a
 │           ├── technique    slide_up/down/hammer/pull/bend/vibrato
+│           ├── slide_to     destination fret (int | None) for slides/pull-offs/hammer-ons
+│           ├── touch_fret   fret number for artificial harmonics (12th-fret touch)
 │           ├── tied, harmonic, triplet
 └── raw_text : str
 ```
