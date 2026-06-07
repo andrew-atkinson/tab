@@ -79,6 +79,7 @@ def parse(path: str) -> TabFile:
 
     meta = TabMetadata(
         title          = tm['title'],
+        subtitle       = tm['subtitle'],
         composer       = tm['composer'],
         composer_dates = tm['composer_dates'],
         transcriber    = tm['transcriber'],

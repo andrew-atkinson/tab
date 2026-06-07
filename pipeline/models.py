@@ -47,6 +47,7 @@ class MeasureData:
 @dataclass
 class TabMetadata:
     title: str = ""
+    subtitle: str = ""
     composer: str = ""
     composer_dates: str = ""
     transcriber: str = ""

@@ -139,6 +139,38 @@ def find_tuning(lines: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 _COMPOSER_SPLIT_RE = re.compile(r'^(.+?)\s+-\s+(.+?)(?:\s+\((\d{4}[^\)]*)\))?\s*$')
+
+# Subtitle helpers ───────────────────────────────────────────────────────────
+# A segment that starts with a digit or "No. N" is a movement indicator, not a
+# composer name (e.g. "3. Danza de las Hachas", "No. 11 in Am").
+_MOVEMENT_PREFIX_RE = re.compile(r'^\d+[\.:]|^No\.?\s*\d', re.IGNORECASE)
+
+
+def _split_subtitle_from_composer(raw_composer: str) -> tuple[str, str]:
+    """
+    If *raw_composer* is actually 'Subtitle - Composer', separate the two.
+
+    Returns (subtitle, actual_composer).  If the last ' - ' segment doesn't
+    look like a composer name, returns ('', raw_composer) unchanged.
+    """
+    if ' - ' not in raw_composer:
+        return '', raw_composer
+
+    parts = [p.strip() for p in raw_composer.split(' - ')]
+    last  = parts[-1]
+
+    # Reject if the last segment looks like a movement label
+    if _MOVEMENT_PREFIX_RE.match(last):
+        return '', raw_composer
+
+    # Accept if it looks like a proper name (capitalised, no leading digit)
+    if re.match(r'^[A-Z][a-z]', last) and len(last) < 60:
+        subtitle = ' - '.join(parts[:-1])
+        return subtitle, last
+
+    return '', raw_composer
+
+
 _AUTHOR_RE = re.compile(
     r'(?:author|by|composer|arranged?\s+by)\s*[:\-–]?\s*(.+)',
     re.IGNORECASE
@@ -151,11 +183,16 @@ _SPACED_COMPOSER_RE = re.compile(r'^(.+?)\s{4,}(.+)$')
 
 def find_composer_author_title(lines: list[str]) -> dict:
     """
-    Extract title, composer, and composer_dates from the header.
+    Extract title, subtitle, composer, and composer_dates from the header.
 
-    Returns a dict with keys: 'title', 'composer', 'composer_dates'.
+    Returns a dict with keys: 'title', 'subtitle', 'composer', 'composer_dates'.
+
+    Three-segment title lines of the form "Collection - Movement - Composer (dates)"
+    are split so that the middle segment becomes the subtitle rather than being
+    absorbed into the composer field.
     """
     title = ""
+    subtitle = ""
     composer = ""
     composer_dates = ""
 
@@ -191,12 +228,15 @@ def find_composer_author_title(lines: list[str]) -> dict:
             if len(line) > 90:
                 continue
 
-            # "Title - Composer (dates)"
+            # "Title - Composer (dates)"  or  "Title - Subtitle - Composer (dates)"
             m = _COMPOSER_SPLIT_RE.match(_clean_value(line))
             if m:
                 title          = _clean_value(m.group(1)).strip('"\'')
-                composer       = _clean_value(m.group(2))
+                raw_composer   = _clean_value(m.group(2))
                 composer_dates = m.group(3) or ""
+                # Separate subtitle from composer when the "composer" field
+                # still contains ' - ' (three-segment title line).
+                subtitle, composer = _split_subtitle_from_composer(raw_composer)
                 break
 
             # "Title          Composer" (4+ spaces separator)
@@ -234,6 +274,7 @@ def find_composer_author_title(lines: list[str]) -> dict:
 
     return {
         'title':          title,
+        'subtitle':       subtitle,
         'composer':       composer,
         'composer_dates': composer_dates,
     }
@@ -415,6 +456,7 @@ def parse_topmatter(lines: list[str]) -> dict:
 
     return {
         'title':          cat['title'],
+        'subtitle':       cat['subtitle'],
         'composer':       cat['composer'],
         'composer_dates': cat['composer_dates'],
         'transcriber':    find_transcriber(lines),

@@ -17,20 +17,34 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
-def _read_title_composer(xml_path: str) -> tuple[str, str]:
-    """Quick parse of title and composer from a MusicXML file."""
+def _read_title_composer(xml_path: str) -> tuple[str, str, str]:
+    """Quick parse of title, subtitle and composer from a MusicXML file.
+
+    Returns (title, subtitle, composer).
+
+    When the file has <work><work-title> the title is the collection name and
+    <movement-title> holds the subtitle/movement name.  When there is no
+    <work-title> the full title lives in <movement-title> and subtitle is ''.
+    """
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
-        title    = root.findtext('movement-title') or Path(xml_path).stem
+        work_title     = root.findtext('.//work/work-title') or ''
+        movement_title = root.findtext('movement-title')     or ''
+        if work_title:
+            title    = work_title.strip()
+            subtitle = movement_title.strip()
+        else:
+            title    = (movement_title or Path(xml_path).stem).strip()
+            subtitle = ''
         composer = ''
         for cr in root.findall('.//creator'):
             if cr.get('type') == 'composer':
                 composer = cr.text or ''
                 break
-        return title.strip(), composer.strip()
+        return title, subtitle, composer.strip()
     except Exception:
-        return Path(xml_path).stem, ''
+        return Path(xml_path).stem, '', ''
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +70,8 @@ _PIECE_TEMPLATE = """\
     }}
     header h1 {{ margin: 0; font-size: 1.25rem; }}
     header p  {{ margin: 0; font-size: 0.85rem; opacity: 0.75; }}
+    header .subtitle {{ font-style: italic; opacity: 0.85; }}
+    header .subtitle:empty {{ display: none; }}
     nav a {{ color: #a0c4ff; text-decoration: none; font-size: 0.85rem; }}
     #controls {{
       display: flex; gap: 0.5rem;
@@ -78,7 +94,10 @@ _PIECE_TEMPLATE = """\
 <body>
 <header>
   <nav><a href="../index.html">← All pieces</a></nav>
-  <h1>{title}</h1>
+  <div>
+    <h1>{title}</h1>
+    <p class="subtitle">{subtitle}</p>
+  </div>
   <p>{composer}</p>
 </header>
 
@@ -246,6 +265,7 @@ _INDEX_TEMPLATE = """\
     tr:hover td {{ background: #f5f5f5; }}
     a {{ color: #1a1a2e; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
+    .subtitle {{ font-size: 0.8rem; color: #777; font-style: italic; display: block; }}
     .hidden {{ display: none; }}
   </style>
 </head>
@@ -331,12 +351,12 @@ def generate_site(xml_dir: str, site_dir: str) -> None:
 
     # Only pick up clean *.xml files — exclude any *.tmp.xml or *.foo.xml artifacts
     xml_files = sorted(f for f in xml_dir.glob('*.xml') if f.suffix == '.xml' and f.stem.endswith('.xml') is False and '.' not in f.stem)
-    pieces = []  # (title, composer, stem, filename)
+    pieces = []  # (title, subtitle, composer, stem, filename)
 
     for xml_path in xml_files:
         stem     = xml_path.stem
         filename = xml_path.name
-        title, composer = _read_title_composer(str(xml_path))
+        title, subtitle, composer = _read_title_composer(str(xml_path))
 
         # Copy XML to site/musicxml/ (kept for reference / server-based use)
         dest_xml = mx_dest_dir / filename
@@ -352,6 +372,7 @@ def generate_site(xml_dir: str, site_dir: str) -> None:
         # Generate piece HTML (xml_content goes verbatim inside <script type="application/xml">)
         html = _PIECE_TEMPLATE.format(
             title=_esc(title),
+            subtitle=_esc(subtitle),
             composer=_esc(composer),
             filename=_esc(filename),
             xml_content=xml_content,
@@ -359,13 +380,23 @@ def generate_site(xml_dir: str, site_dir: str) -> None:
         piece_html_path = pieces_dir / f'{stem}.html'
         piece_html_path.write_text(html, encoding='utf-8')
 
-        pieces.append((title, composer, stem, filename))
+        pieces.append((title, subtitle, composer, stem, filename))
 
-    # Generate index
+    # Generate index — subtitle shown as a secondary line within the title cell
+    def _row(title, subtitle, composer, stem):
+        subtitle_html = (
+            f'<span class="subtitle">{_esc(subtitle)}</span>' if subtitle else ''
+        )
+        return (
+            f'    <tr><td><a href="pieces/{_esc(stem)}.html">{_esc(title)}</a>'
+            f'{subtitle_html}</td>'
+            f'<td>{_esc(composer)}</td></tr>'
+        )
+
     rows_html = '\n'.join(
-        f'    <tr><td><a href="pieces/{_esc(stem)}.html">{_esc(title)}</a></td>'
-        f'<td>{_esc(composer)}</td></tr>'
-        for (title, composer, stem, _) in sorted(pieces, key=lambda x: x[0].lower())
+        _row(title, subtitle, composer, stem)
+        for (title, subtitle, composer, stem, _)
+        in sorted(pieces, key=lambda x: x[0].lower())
     )
     index_html = _INDEX_TEMPLATE.format(count=len(pieces), rows=rows_html)
     (site_dir / 'index.html').write_text(index_html, encoding='utf-8')

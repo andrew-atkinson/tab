@@ -504,8 +504,9 @@ def build_musicxml(
     -------
     ET.Element — the <score-partwise> root of a valid MusicXML document.
     """
-    meta  = expanded.metadata
+    meta     = expanded.metadata
     title    = meta.title    if meta else ''
+    subtitle = meta.subtitle if meta else ''
     composer = meta.composer if meta else ''
     tuning_s = meta.tuning   if meta else 'EADGBE'
     tuning   = tuning_to_midi(tuning_s)   # high→low MIDI pitches
@@ -530,8 +531,14 @@ def build_musicxml(
     root = ET.Element('score-partwise')
     root.set('version', '3.1')
 
-    # Movement title / identification
-    if title:
+    # Title / subtitle structure:
+    #   Subtitle present → <work><work-title> = collection,  <movement-title> = movement
+    #   No subtitle      → <movement-title> = full title  (backwards-compatible)
+    if subtitle:
+        work = ET.SubElement(root, 'work')
+        ET.SubElement(work, 'work-title').text = title
+        ET.SubElement(root, 'movement-title').text = subtitle
+    elif title:
         ET.SubElement(root, 'movement-title').text = title
     ident = ET.SubElement(root, 'identification')
     cr = ET.SubElement(ident, 'creator')
