@@ -28,6 +28,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from typing import Optional
 from parse_txt import TabFile, tuning_to_midi, note_midi
+from issues_log import log_issue
 
 
 # ---------------------------------------------------------------------------
@@ -138,21 +139,27 @@ def _match_within_measure(
     Match *xml_notes* to *tab_notes* within a single measure using
     pitch proximity (±2 semitones) with a short lookahead.
 
-    Each tab_note tuple is:
-      (midi, string, fret, finger, tech, rh_finger, harmonic[, slide_dest_midi])
+    Tab-note tuples (index meanings):
+      0 midi  1 string  2 fret  3 finger  4 tech  5 rh_finger  6 harmonic
+      7 slide_dest_midi  8 slide_dest_fret  9 col (beat column)
 
-    The tab is canonical: when the MIDI has extra notes the algorithm
-    skips them (they receive pitch-fallback annotation later).  When the
-    tab has extra notes (e.g. a spurious slide target) the algorithm
-    skips those tab notes so they cannot consume a real MIDI note.
+    Chord deduplication and pitch-descending sort of each XML beat group
+    must be applied by the caller (*_match_by_measure*) before this function
+    is invoked.
+
+    Skip-TAB beat-boundary rule: when searching for a closer tab note by
+    skipping ahead (e.g. the MIDI chord has fewer notes than the tab chord),
+    the algorithm must not jump past notes that belong to the *same* tab beat
+    column.  Crossing a beat boundary would assign a beat-N MIDI note to a
+    beat-N+1 tab slot, producing two notes on the same string within the same
+    chord group.
 
     Slide handling: a slide (e.g. 3/7) is one tab NoteEvent but the MIDI
     typically records both the source pitch and the destination pitch as
     separate note-on events.  After matching a slide note, the algorithm
     looks at the immediately following XML note and consumes it silently if
-    its pitch matches the slide destination (±2 semitones).  This prevents
-    the orphaned destination note from being passed to the pitch-fallback
-    and rendered as a spurious extra note.
+    its pitch matches the slide destination (±2 semitones), annotating it
+    with 'slide_stop' so the renderer draws the arrival endpoint.
 
     Returns {local_xml_index: (string, fret, finger, tech, rh_finger, harmonic)}.
     """
@@ -165,12 +172,8 @@ def _match_within_measure(
         """
         If *tab_tup* is a slide note and the XML note at *xi* matches the
         slide's destination pitch, annotate that XML note with the slide's
-        destination fret and return xi+1.  Otherwise return xi unchanged.
-
-        This handles the common case where the MIDI encodes both the slide
-        source pitch and the slide destination pitch as separate note-on
-        events, while the tab represents the whole slide as a single
-        NoteEvent (with slide_to carrying the destination fret).
+        destination fret (and a 'slide_stop' technique so the renderer draws
+        the arrival endpoint) and return xi+1.  Otherwise return xi unchanged.
         """
         if tab_tup[4] not in ('slide_up', 'slide_down') or len(tab_tup) <= 8:
             return xi
@@ -182,9 +185,10 @@ def _match_within_measure(
             return xi
         dest_xml_midi = _xml_note_midi(xml_notes[xi][1])
         if abs(dest_xml_midi - slide_dest_midi) <= 2:
-            # Annotate the MIDI destination note with the slide's string + dest fret.
+            # Annotate with dest fret and 'slide_stop' so the renderer draws
+            # the arrival side of the slide line.
             result[xi] = (tab_tup[1], slide_dest_fret, tab_tup[3],
-                          None, tab_tup[5], tab_tup[6])
+                          'slide_stop', tab_tup[5], tab_tup[6])
             return xi + 1
         return xi
 
@@ -218,11 +222,21 @@ def _match_within_measure(
         if matched:
             continue
 
-        # Try skipping tab notes (e.g. slide targets without a MIDI note)
+        # Try skipping tab notes (e.g. the tab chord has more notes than the
+        # MIDI chord because some inner voices are absent from the MIDI).
+        # Beat-boundary rule: never jump past the current tab beat column.
+        # Crossing a beat boundary can assign a MIDI chord note to a later
+        # beat's tab slot, producing two different tab positions on the same
+        # string within what the renderer treats as one chord group.
+        current_col = tab_tup[9] if len(tab_tup) > 9 else None
         for skip_t in range(1, LOOKAHEAD + 1):
             if ti + skip_t >= len(tab_notes):
                 break
             alt = tab_notes[ti + skip_t]
+            # Stop searching once we've crossed into the next beat.
+            alt_col = alt[9] if len(alt) > 9 else None
+            if current_col is not None and alt_col is not None and alt_col != current_col:
+                break
             if abs(xml_midi - alt[0]) <= 2:
                 result[xi] = (alt[1], alt[2], alt[3], alt[4], alt[5], alt[6])
                 xi += 1
@@ -233,6 +247,24 @@ def _match_within_measure(
 
         if not matched:
             xi += 1
+
+    # ── Post-match deduplication ─────────────────────────────────────────────
+    # Resolve same-string conflicts within each beat group.  When two matched
+    # XML notes end up on the same string at the same beat offset — typically
+    # because a multi-part MIDI has two inner-voice notes both close (±2 st)
+    # to the same tab note — keep only the first (lower-xi) match since it was
+    # assigned to a tab note with a tighter pitch error.  The later one falls
+    # through to pitch-fallback, which places it on a different string.
+    beat_string_first: dict[tuple[int, int], int] = {}  # (offset, string) → xi
+    for xi_val in sorted(result):
+        m = result[xi_val]
+        string = m[0]
+        off    = xml_notes[xi_val][0]
+        key    = (off, string)
+        if key in beat_string_first:
+            del result[xi_val]   # duplicate: remove later match
+        else:
+            beat_string_first[key] = xi_val
 
     return result
 
@@ -274,8 +306,12 @@ def _match_by_measure(
         xml_meas = xml_measures[meas_idx]
         md       = tab.measures[tab_mnum]
 
-        # Collect XML pitched notes from this measure with local beat offsets
-        xml_notes: list[tuple[int, ET.Element]] = []
+        # Collect XML pitched notes from this measure with local beat offsets.
+        # Within each chord group (same beat offset), sort by pitch descending
+        # so the order matches the tab's natural string-1-first ordering
+        # (string 1 = highest pitch in standard tuning).  This prevents the
+        # skip-heavy lookahead from misassigning strings within chords.
+        raw_xml: list[tuple[int, ET.Element]] = []
         offset   = 0
         prev_dur = 0
         for note_el in xml_meas.findall('note'):
@@ -289,7 +325,30 @@ def _match_by_measure(
                 prev_dur = dur
                 offset  += dur
             if not is_rest and note_el.find('pitch') is not None:
-                xml_notes.append((note_off, note_el))
+                raw_xml.append((note_off, note_el))
+
+        # Sort each chord group (same offset) by pitch descending so the order
+        # matches the tab's natural string-1-first (= high-pitch-first) ordering.
+        # Also deduplicate by pitch within the group: MIDI files sometimes have
+        # two parts both notating the same pitch at the same beat (e.g. treble
+        # and bass lines doubling), which would otherwise produce two XML notes
+        # that both match the same tab entry and land on the same string.
+        xml_notes: list[tuple[int, ET.Element]] = []
+        i = 0
+        while i < len(raw_xml):
+            j = i + 1
+            while j < len(raw_xml) and raw_xml[j][0] == raw_xml[i][0]:
+                j += 1
+            group = raw_xml[i:j]
+            group.sort(key=lambda x: _xml_note_midi(x[1]), reverse=True)
+            # Deduplicate by MIDI pitch within the group (keep first occurrence).
+            seen_pitches: set[int] = set()
+            for item in group:
+                p = _xml_note_midi(item[1])
+                if p not in seen_pitches:
+                    seen_pitches.add(p)
+                    xml_notes.append(item)
+            i = j
 
         # Collect tab notes for this measure sorted by (col, string)
         tab_notes: list[tuple] = []
@@ -305,7 +364,8 @@ def _match_by_measure(
             slide_dest_fret = ev.slide_to  # None if not a slide
             tab_notes.append((midi, ev.string, ev.fret, ev.finger,
                               ev.technique, ev.rh_finger, ev.harmonic,
-                              slide_dest_midi, slide_dest_fret))
+                              slide_dest_midi, slide_dest_fret,
+                              ev.col))         # index 9: beat column
 
         if not xml_notes or not tab_notes:
             continue
@@ -391,6 +451,10 @@ def _add_technical(xml_note: ET.Element, string: int, fret: int,
         sl = ET.SubElement(technical, 'slide')
         sl.set('type', 'start')
         sl.set('line-type', 'solid')
+    elif technique == 'slide_stop':
+        sl = ET.SubElement(technical, 'slide')
+        sl.set('type', 'stop')
+        sl.set('line-type', 'solid')
     elif technique == 'bend':
         ET.SubElement(technical, 'other-technical').text = 'bend'
     elif technique == 'vibrato':
@@ -429,9 +493,18 @@ def _add_barre_to_first_measure(part: ET.Element, fret: int, partial: bool) -> N
 # Main
 # ---------------------------------------------------------------------------
 
-def annotate(xml_path: str, tab: TabFile, out_path: str) -> str:
+def annotate(xml_path: str, tab: TabFile, out_path: str,
+             stem: str = '') -> str:
     """
     Load *xml_path*, annotate with *tab* data, write to *out_path*.
+
+    Parameters
+    ----------
+    xml_path : path to the raw (un-annotated) MusicXML file
+    tab      : parsed TabFile (ground truth)
+    out_path : destination path for the annotated MusicXML
+    stem     : filename stem of the source .txt (used in issue log entries)
+
     Returns *out_path*.
     """
     tree = ET.parse(xml_path)
@@ -510,6 +583,78 @@ def annotate(xml_path: str, tab: TabFile, out_path: str) -> str:
 
     # Add repeat barlines and barre direction text
     _add_repeat_barlines(root, tab)
+
+    # ── Bar-count consistency check ──────────────────────────────────────────
+    # The tab (.txt) is ground truth.  The MIDI should contain exactly as many
+    # non-empty measures.  A mismatch signals a transcription problem (e.g. the
+    # MIDI was recorded with repeats expanded while the tab is written once).
+    # We do NOT truncate — we log the issue and leave the MIDI untouched so the
+    # rendered score faithfully reflects both sources.  Any extra MIDI measures
+    # beyond the tab will receive pitch-fallback-only annotation (no tab data).
+    part = root.find('.//part')
+    if part is not None:
+        tab_count   = len(sorted(tab.measures.keys()))
+        xml_all     = part.findall('measure')
+        xml_nonempty = sum(
+            1 for m in xml_all
+            if any(n.find('pitch') is not None and n.find('rest') is None
+                   for n in m.findall('note'))
+        )
+        if xml_nonempty != tab_count:
+            log_issue(
+                stem       = stem,
+                title      = tab.metadata.title,
+                composer   = tab.metadata.composer,
+                bar_number = None,
+                issue_type = 'bar_count_mismatch',
+                details    = (
+                    f'MIDI has {xml_nonempty} non-empty measures but tab has '
+                    f'{tab_count}.  Difference: {xml_nonempty - tab_count:+d}.  '
+                    f'Likely cause: MIDI recorded with repeats expanded or '
+                    f'missing sections.'
+                ),
+            )
+
+    # ── Duplicate-string detection ───────────────────────────────────────────
+    # After annotation, scan every beat group for notes that share the same
+    # string.  A guitar cannot play two notes on one string simultaneously, so
+    # any duplicate indicates an annotation error (usually a pitch-proximity
+    # false match).  Log each occurrence so the transcription can be reviewed.
+    part = root.find('.//part')
+    if part is not None:
+        tab_keys = sorted(tab.measures.keys())
+        for midx, meas in enumerate(part.findall('measure')):
+            tab_mnum = tab_keys[midx] if midx < len(tab_keys) else None
+            offset = 0; prev_dur = 0; beat_strings: dict[int, list[int]] = {}
+            for note_el in meas.findall('note'):
+                is_chord = note_el.find('chord') is not None
+                is_rest  = note_el.find('rest')  is not None
+                dur      = int(note_el.findtext('duration', '0'))
+                if is_chord:
+                    off = offset - prev_dur
+                else:
+                    off = offset; prev_dur = dur; offset += dur
+                if is_rest or note_el.find('pitch') is None:
+                    continue
+                ann = matches.get(id(note_el))
+                if ann is None:
+                    continue
+                beat_strings.setdefault(off, []).append(ann[0])
+            for off, strings in beat_strings.items():
+                dups = [s for s in set(strings) if strings.count(s) > 1]
+                if dups:
+                    log_issue(
+                        stem       = stem,
+                        title      = tab.metadata.title,
+                        composer   = tab.metadata.composer,
+                        bar_number = tab_mnum,
+                        issue_type = 'duplicate_string_in_beat',
+                        details    = (
+                            f'Beat at offset {off} in XML measure '
+                            f'{meas.get("number")} (tab bar {tab_mnum}): '
+                            f'strings assigned = {strings}; duplicates = {dups}.'
+                        ),
+                    )
 
     # ── Write ────────────────────────────────────────────────────────────────
     import os

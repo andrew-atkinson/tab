@@ -1235,13 +1235,16 @@ class TestSlideDestAnnotation(unittest.TestCase):
         self.assertEqual(result[0][:2], (1, 3), "Source: s1 fret=3")
         self.assertEqual(result[1][:2], (1, 7), "Dest:   s1 fret=7")
 
-    def test_dest_technique_is_none(self):
-        """The dest note must NOT inherit the slide technique."""
+    def test_dest_technique_is_slide_stop(self):
+        """
+        The dest note must carry 'slide_stop' (not 'slide_up') so the
+        renderer draws the arrival endpoint of the slide line.
+        """
         from annotate_xml import _match_within_measure
         tab    = [self._tab(67, 1, 3, 'slide_up', 71, 7)]
         result = _match_within_measure(self._xml(67, 71), tab)
-        self.assertIsNone(result[1][3],
-            "Dest note must not carry 'slide_up' technique")
+        self.assertEqual(result[1][3], 'slide_stop',
+            "Dest note must carry 'slide_stop', not 'slide_up' or None")
 
     def test_dest_uses_slide_string(self):
         """Dest annotation must use the slide's string number."""
@@ -1386,6 +1389,362 @@ class TestSlideDestAnnotation(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 # Real-file slide integration  (Choros No. 1, bars 4, 9, 10)
 # ═══════════════════════════════════════════════════════════════════════════
+
+class TestNoDuplicateStringsInChord(unittest.TestCase):
+    """
+    A guitar has only one string per pitch slot: two notes cannot sound
+    simultaneously on the same string.  After annotation, every chord group
+    (notes sharing a beat offset in the rendered MusicXML) must use distinct
+    string numbers.
+
+    Failure here means the annotator assigned the same string to two MIDI
+    notes in the same beat — an impossible voicing that produces overlapping
+    tab numbers in the rendered score.
+    """
+
+    @classmethod
+    def _annotated_measures(cls, txt_stem, mid_stem):
+        """Return a list of measure elements from the annotated XML."""
+        import warnings, tempfile, os
+        warnings.filterwarnings('ignore')
+        import xml.etree.ElementTree as ET
+        from parse_txt import parse
+        from tab_parser import tuning_to_midi
+        from convert_mid import mid_to_musicxml
+        from annotate_xml import _merge_parts, _match_by_measure, _xml_note_midi
+
+        txt = CLASSTAB / (txt_stem + '.txt')
+        mid = CLASSTAB / (mid_stem + '.mid')
+        if not txt.exists() or not mid.exists():
+            return None, None
+
+        tab = parse(str(txt))
+        tuning_midi = tuning_to_midi(tab.metadata.tuning)
+        tmp = tempfile.mktemp(suffix='.xml')
+        try:
+            mid_to_musicxml(str(mid), tmp)
+            root = ET.parse(tmp).getroot()
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        _merge_parts(root)
+        matches = _match_by_measure(root, tab, tuning_midi)
+        part = root.find('.//part')
+        return part.findall('measure'), matches
+
+    def _check_no_dup_strings(self, txt_stem, mid_stem):
+        """
+        Run the duplicate-string check for one piece.  Any duplicate is
+        logged to the issues log AND causes the test to fail so it cannot
+        be silently overlooked.
+        """
+        from annotate_xml import _xml_note_midi
+        from issues_log import log_issue
+        from parse_txt import parse
+        import xml.etree.ElementTree as ET
+
+        measures, matches = self._annotated_measures(txt_stem, mid_stem)
+        if measures is None:
+            self.skipTest(f'{txt_stem} files not found in tab/')
+
+        tab        = parse(str(CLASSTAB / (txt_stem + '.txt')))
+        tab_keys   = sorted(tab.measures.keys())
+        failures   = []
+
+        for midx, meas in enumerate(measures):
+            tab_mnum   = tab_keys[midx] if midx < len(tab_keys) else None
+            offset = 0; prev_dur = 0
+            beat_strings: dict[int, list[int]] = {}
+            for note in meas.findall('note'):
+                is_chord = note.find('chord') is not None
+                is_rest  = note.find('rest')  is not None
+                dur = int(note.findtext('duration', '0'))
+                if is_chord:
+                    off = offset - prev_dur
+                else:
+                    off = offset; prev_dur = dur; offset += dur
+                if is_rest or note.find('pitch') is None:
+                    continue
+                nid = id(note)
+                if nid not in matches:
+                    continue
+                beat_strings.setdefault(off, []).append(matches[nid][0])
+
+            for off, strings in beat_strings.items():
+                dups = [s for s in set(strings) if strings.count(s) > 1]
+                if dups:
+                    msg = (
+                        f'{txt_stem} measure #{meas.get("number")} '
+                        f'(tab bar {tab_mnum}) offset={off}: '
+                        f'duplicate strings {dups} — full beat: {strings}'
+                    )
+                    log_issue(
+                        stem       = txt_stem,
+                        title      = tab.metadata.title,
+                        composer   = tab.metadata.composer,
+                        bar_number = tab_mnum,
+                        issue_type = 'duplicate_string_in_beat',
+                        details    = msg,
+                    )
+                    failures.append(msg)
+
+        self.assertEqual(
+            failures, [],
+            f'{txt_stem}: {len(failures)} beat(s) have duplicate string '
+            f'assignments (see issues log):\n' + '\n'.join(failures[:5]),
+        )
+
+    # ── pieces covered ────────────────────────────────────────────────────────
+
+    def test_choros_no1_no_dup_strings(self):
+        """Choros No.1 (2-part MIDI): no beat may assign the same string twice."""
+        self._check_no_dup_strings(
+            'villa-lobos_choros_01', 'villa-lobos_choros_01')
+
+    def test_el_negrito_no_dup_strings(self):
+        """El Negrito (1-part MIDI): no beat may assign the same string twice."""
+        self._check_no_dup_strings(
+            'lauro_two_venezuelan_waltzes_1_el_negrito',
+            'lauro_two_venezuelan_waltzes_1_el_negrito')
+
+    def test_barrios_no_dup_strings(self):
+        """Barrios Un Sueño (5-part MIDI): no beat may assign the same string twice."""
+        self._check_no_dup_strings(
+            'barrios_un_sueno_en_la_floresta',
+            'barrios_un_sueno_en_la_floresta')
+
+    def test_cardoso_no_dup_strings(self):
+        """Cardoso milonga (3-part MIDI): no beat may assign the same string twice."""
+        self._check_no_dup_strings(
+            'cardoso_suite_sudamericana_09_aire_de_milonga',
+            'cardoso_suite_sudamericana_09_aire_de_milonga')
+
+    def test_bach_no_dup_strings(self):
+        """Bach Jesu Joy (1-part MIDI, alternate stem): no duplicate strings."""
+        self._check_no_dup_strings(
+            'bach_js_bwv0147_10_jesu_joy_of_mans_desiring',
+            'bach_js_bwv0147_10_jesu_joy_of_mans_desiring_1')
+
+    def test_albeniz_no_dup_strings(self):
+        """Albéniz Tango (4-part MIDI): no duplicate strings."""
+        self._check_no_dup_strings(
+            'albeniz_isaac_op165_no2_tango_in_d',
+            'albeniz_isaac_op165_no2_tango_in_d')
+
+
+class TestBarCountInfo(unittest.TestCase):
+    """
+    Unit tests for tab_parser.bar_count_info() and bar_index_start().
+
+    Verifies that the helpers correctly detect 0-indexed vs 1-indexed pieces
+    and compute span / gap counts that feed into the bar-count comparison.
+    """
+
+    def _info(self, keys):
+        """Build a fake measures dict and return bar_count_info."""
+        from tab_parser import bar_count_info
+        from models import MeasureData
+        measures = {k: MeasureData(number=k) for k in keys}
+        return bar_count_info(measures)
+
+    def test_one_indexed_no_gaps(self):
+        info = self._info(range(1, 49))   # bars 1..48
+        self.assertEqual(info['bar_index_start'],  1)
+        self.assertEqual(info['bar_count_written'], 48)
+        self.assertEqual(info['bar_count_span'],    48)
+        self.assertEqual(info['bar_count_gaps'],     0)
+
+    def test_zero_indexed_no_gaps(self):
+        info = self._info(range(0, 48))   # bars 0..47
+        self.assertEqual(info['bar_index_start'],   0)
+        self.assertEqual(info['bar_count_written'], 48)
+        self.assertEqual(info['bar_count_span'],    48)
+        self.assertEqual(info['bar_count_gaps'],     0)
+
+    def test_zero_indexed_with_gaps(self):
+        """El-Negrito-style: 0-indexed with two repeated sections as gaps."""
+        keys = list(range(0, 20)) + list(range(34, 49)) + list(range(64, 81))
+        info = self._info(keys)
+        self.assertEqual(info['bar_index_start'],   0)
+        self.assertEqual(info['bar_count_written'], 52)  # unique bars
+        self.assertEqual(info['bar_count_span'],    81)  # 0..80 = 81 slots
+        self.assertEqual(info['bar_count_gaps'],    29)
+
+    def test_one_indexed_with_small_gaps(self):
+        """Choros-style: 1-indexed with a handful of gaps."""
+        keys = list(range(1, 136))        # 1..135 but some missing
+        keys = [k for k in keys if k not in {7, 14, 21, 28, 35}]
+        info = self._info(keys)
+        self.assertEqual(info['bar_index_start'],   1)
+        self.assertEqual(info['bar_count_written'], 130)
+        self.assertEqual(info['bar_count_span'],    135)
+        self.assertEqual(info['bar_count_gaps'],      5)
+
+    def test_empty_measures(self):
+        from tab_parser import bar_count_info
+        info = bar_count_info({})
+        self.assertEqual(info['bar_count_written'], 0)
+        self.assertEqual(info['bar_count_span'],    0)
+
+    def test_el_negrito_real_file(self):
+        """Verify the real El Negrito file is detected as 0-indexed with gaps."""
+        txt = CLASSTAB / 'lauro_two_venezuelan_waltzes_1_el_negrito.txt'
+        if not txt.exists():
+            self.skipTest('El Negrito not found')
+        from parse_txt import parse
+        from tab_parser import bar_count_info
+        tab  = parse(str(txt))
+        info = bar_count_info(tab.measures)
+        self.assertEqual(info['bar_index_start'], 0,
+            'El Negrito must be detected as 0-indexed')
+        self.assertGreater(info['bar_count_gaps'], 0,
+            'El Negrito must have gap bars (repeated sections)')
+        # Span should be close to MIDI's 80 non-empty measures
+        self.assertAlmostEqual(info['bar_count_span'], 80, delta=2,
+            msg=f"span={info['bar_count_span']} should be ≈80")
+
+    def test_choros_real_file(self):
+        """Choros No.1 is 1-indexed."""
+        txt = CLASSTAB / 'villa-lobos_choros_01.txt'
+        if not txt.exists():
+            self.skipTest('Choros not found')
+        from parse_txt import parse
+        from tab_parser import bar_count_info
+        tab  = parse(str(txt))
+        info = bar_count_info(tab.measures)
+        self.assertEqual(info['bar_index_start'], 1,
+            'Choros No.1 must be detected as 1-indexed')
+
+
+class TestXmlBarCountMatchesTab(unittest.TestCase):
+    """
+    The MIDI must have the same number of non-empty measures as the written
+    tab (.txt).  The tab is ground truth; the MIDI should reflect it exactly.
+
+    A mismatch is a transcription problem — for example the MIDI was recorded
+    with repeats expanded while the tab is written with repeat signs.  We do
+    NOT truncate the MIDI silently; instead we record the discrepancy in the
+    issues log and fail the test so the problem is visible.
+
+    Bar counts are compared on the RAW (pre-annotation) merged MIDI so no
+    post-processing hides the discrepancy.
+    """
+
+    @classmethod
+    def _bar_counts(cls, txt_stem, mid_stem):
+        """
+        Return (bci, midi_nonempty) where bci is the bar_count_info dict.
+        Returns (None, None) if either file is missing.
+        """
+        import warnings, tempfile, os
+        warnings.filterwarnings('ignore')
+        import xml.etree.ElementTree as ET
+        from parse_txt import parse
+        from tab_parser import bar_count_info
+        from convert_mid import mid_to_musicxml
+        from annotate_xml import _merge_parts
+
+        txt = CLASSTAB / (txt_stem + '.txt')
+        mid = CLASSTAB / (mid_stem + '.mid')
+        if not txt.exists() or not mid.exists():
+            return None, None
+
+        tab = parse(str(txt))
+        bci = bar_count_info(tab.measures)
+
+        tmp = tempfile.mktemp(suffix='.xml')
+        try:
+            mid_to_musicxml(str(mid), tmp)
+            root = ET.parse(tmp).getroot()
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        _merge_parts(root)
+        part = root.find('.//part')
+        midi_nonempty = sum(
+            1 for m in part.findall('measure')
+            if any(
+                n.find('pitch') is not None and n.find('rest') is None
+                for n in m.findall('note')
+            )
+        ) if part is not None else 0
+
+        return bci, midi_nonempty
+
+    def _check(self, txt_stem, mid_stem):
+        """
+        Assert MIDI non-empty measure count ≈ tab bar_count_span.
+
+        Uses bar_count_span (max_key − min_key + 1) rather than the simpler
+        len(measures), because gap bars in the measure numbering represent
+        repeated sections that the MIDI plays through but the tab writes only
+        once.  For 0-indexed pieces a difference of exactly 1 is tolerated
+        (the pickup bar is often folded into bar 1 in the MIDI).
+        """
+        from issues_log import log_issue
+        from parse_txt import parse
+
+        bci, midi_count = self._bar_counts(txt_stem, mid_stem)
+        if bci is None:
+            self.skipTest(f'{txt_stem} files not found in tab/')
+
+        index_start  = bci['bar_index_start']
+        bar_span     = bci['bar_count_span']
+        bar_written  = bci['bar_count_written']
+        bar_gaps     = bci['bar_count_gaps']
+        diff         = midi_count - bar_span
+        pickup_tol   = 1 if index_start == 0 else 0
+        mismatch     = abs(diff) > pickup_tol
+
+        if mismatch:
+            tab = parse(str(CLASSTAB / (txt_stem + '.txt')))
+            log_issue(
+                stem       = txt_stem,
+                title      = tab.metadata.title,
+                composer   = tab.metadata.composer,
+                bar_number = None,
+                issue_type = 'bar_count_mismatch',
+                details    = (
+                    f'MIDI has {midi_count} non-empty measures. '
+                    f'Tab: index_start={index_start}, span={bar_span}, '
+                    f'written={bar_written}, gaps={bar_gaps}. '
+                    f'Diff (MIDI−span)={diff:+d}. '
+                    f'Likely cause: repeats expanded in MIDI or missing sections.'
+                ),
+            )
+
+        self.assertFalse(
+            mismatch,
+            f'{txt_stem}: MIDI has {midi_count} non-empty measures but '
+            f'tab span={bar_span} (index_start={index_start}, '
+            f'written={bar_written}, gaps={bar_gaps}), diff={diff:+d} '
+            f'— exceeds tolerance of ±{pickup_tol} (see issues log).',
+        )
+
+    def test_choros_no1_bar_count(self):
+        """
+        Choros No.1: MIDI measure count must equal tab measure count.
+        Known issue: MIDI has 190 non-empty bars vs 135 in the tab — the
+        MIDI was recorded with some passages repeated.  This test documents
+        the mismatch so it can be investigated and resolved.
+        """
+        self._check('villa-lobos_choros_01', 'villa-lobos_choros_01')
+
+    def test_el_negrito_bar_count(self):
+        """El Negrito: MIDI and tab must agree on bar count."""
+        self._check(
+            'lauro_two_venezuelan_waltzes_1_el_negrito',
+            'lauro_two_venezuelan_waltzes_1_el_negrito',
+        )
+
+    def test_barrios_bar_count(self):
+        """Barrios Un Sueño: MIDI and tab must agree on bar count."""
+        self._check(
+            'barrios_un_sueno_en_la_floresta',
+            'barrios_un_sueno_en_la_floresta',
+        )
+
 
 class TestChoros01SlideAnnotation(unittest.TestCase):
     """
@@ -1654,6 +2013,11 @@ def main():
         TestBeatInvariants_Albeniz,
         # Slide-destination annotation
         TestSlideDestAnnotation,
+        # Bar-indexing helpers
+        TestBarCountInfo,
+        # Chord-level annotation correctness
+        TestNoDuplicateStringsInChord,
+        TestXmlBarCountMatchesTab,
         TestChoros01SlideAnnotation,
         # Integration
         TestIntegration,

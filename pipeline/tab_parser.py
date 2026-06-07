@@ -486,6 +486,68 @@ def detect_repeat_volta(
 # Main tab parser
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Bar-numbering helpers
+# ---------------------------------------------------------------------------
+
+def bar_index_start(measures: dict) -> int:
+    """
+    Return the starting measure number used by the tab file.
+
+    Most pieces number their first bar as 1 (one-indexed).  A minority use 0
+    — typically when a pickup/anacrusis is present and labelled bar 0, with
+    the first full bar being bar 1.
+
+    Returns the minimum key in *measures*, which is almost always 0 or 1.
+    Stores cleanly in pieces.json as ``"bar_index_start": 0`` or ``1``.
+    """
+    if not measures:
+        return 1
+    return min(measures.keys())
+
+
+def bar_count_info(measures: dict) -> dict:
+    """
+    Return a dict of bar-count metrics for *measures* (a dict[int, MeasureData]).
+
+    Keys returned
+    -------------
+    bar_index_start : int
+        Starting measure number (0 or 1, see :func:`bar_index_start`).
+    bar_count_written : int
+        Number of *unique* written measures in the tab (``len(measures)``).
+        This is the count of distinct notated bars — repeated sections appear
+        only once, so the number is lower than what the MIDI plays.
+    bar_count_span : int
+        Full numeric span: ``max_key − min_key + 1``.  For tabs without
+        repeats this equals *bar_count_written*.  For tabs where repeated
+        sections are represented by a jump in measure numbers (i.e. the
+        section is played twice in the MIDI but written once in the tab), the
+        span includes the "gap" bars and matches the MIDI's total measure
+        count.  This is the correct value to compare against the MIDI.
+    bar_count_gaps : int
+        ``bar_count_span − bar_count_written``.  A non-zero value means the
+        tab uses measure-number jumps to represent repeated sections.
+    """
+    if not measures:
+        return {
+            'bar_index_start':  1,
+            'bar_count_written': 0,
+            'bar_count_span':    0,
+            'bar_count_gaps':    0,
+        }
+    keys    = sorted(measures.keys())
+    mn, mx  = keys[0], keys[-1]
+    written = len(keys)
+    span    = mx - mn + 1
+    return {
+        'bar_index_start':   mn,
+        'bar_count_written': written,
+        'bar_count_span':    span,
+        'bar_count_gaps':    span - written,
+    }
+
+
 def get_beats(notes: list[NoteEvent]) -> list[list[NoteEvent]]:
     """
     Group NoteEvents into beats — lists of notes that are simultaneous
