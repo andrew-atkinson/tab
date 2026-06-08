@@ -82,6 +82,54 @@ def _int_to_roman(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tab-encoded duration support
+# ---------------------------------------------------------------------------
+
+# Tick values at divisions=384 (chosen so triplet eighths = 128 — an integer).
+_TAB_DUR_TICKS_384: dict[str, int] = {
+    'H': 768, 'Q': 384, 'E': 192, 'S': 96,
+}
+_TAB_DUR_TYPE: dict[str, str] = {
+    'H': 'half', 'Q': 'quarter', 'E': 'eighth', 'S': '16th',
+}
+# divisions=384 is required whenever any note uses a tab-encoded duration,
+# because triplet eighths (192 × 2/3 = 128) must be integers.
+TAB_DIVISIONS = 384
+
+
+def _parse_tab_dur(dur_str: str) -> tuple[int, str, int, bool, bool]:
+    """
+    Decode a tab duration string (as stored in NoteEvent.tab_duration).
+
+    Format:  [3]<BASE>[.][+]
+      3    = triplet (prefix)
+      BASE = H | Q | E | S
+      .    = dotted (× 1.5)
+      +    = tied to next note
+
+    All tick values are at TAB_DIVISIONS (384) ticks per quarter note.
+
+    Returns (ticks, note_type, dots, is_triplet, is_tied).
+    """
+    s = dur_str
+    is_triplet = s.startswith('3')
+    if is_triplet:
+        s = s[1:]
+    if not s or s[0] not in _TAB_DUR_TICKS_384:
+        # Unrecognised code — fall back to quarter note
+        return TAB_DIVISIONS, 'quarter', 0, False, False
+    base      = s[0]
+    dotted    = '.' in s
+    is_tied   = '+' in s
+    ticks     = _TAB_DUR_TICKS_384[base]
+    if dotted:
+        ticks = ticks * 3 // 2
+    if is_triplet:
+        ticks = ticks * 2 // 3
+    return ticks, _TAB_DUR_TYPE[base], (1 if dotted else 0), is_triplet, is_tied
+
+
+# ---------------------------------------------------------------------------
 # Technical annotation
 # ---------------------------------------------------------------------------
 
@@ -148,24 +196,30 @@ def _add_technical(
 # ---------------------------------------------------------------------------
 
 def _beat_to_xml_notes(
-    beat      : list[NoteEvent],
-    dur_ticks : int,
-    note_type : str,
-    dots      : int,
-    divisions : int,
-    tuning    : list[int],
-    voice     : int = 1,
+    beat          : list[NoteEvent],
+    dur_ticks     : int,
+    note_type     : str,
+    dots          : int,
+    divisions     : int,
+    tuning        : list[int],
+    voice         : int = 1,
     tech_overrides: Optional[dict[int, str]] = None,
+    is_triplet    : bool = False,
+    tuplet_type   : Optional[str] = None,   # 'start' | 'stop' | None
 ) -> list[ET.Element]:
     """
     Convert one simultaneously-struck tab beat group into MusicXML <note>s.
 
     The first note is a regular note; subsequent ones carry <chord/> so they
-    sound together.  All share the same duration derived from MIDI timing.
+    sound together.  All share the same duration derived from MIDI timing or
+    a tab-encoded duration string.
 
     tech_overrides: optional {string → technique} to override ev.technique for
     notes that have been identified as technique stop destinations (slide_stop,
     hammer_stop, pull_stop).
+    is_triplet    : when True, emit <time-modification> for 3-in-2 tuplets.
+    tuplet_type   : 'start' on the first note of a triplet group, 'stop' on
+                    the last; None otherwise.
     """
     elements: list[ET.Element] = []
     for idx, ev in enumerate(beat):
@@ -179,6 +233,10 @@ def _beat_to_xml_notes(
         ET.SubElement(note_el, 'type').text = note_type
         for _ in range(dots):
             ET.SubElement(note_el, 'dot')
+        if is_triplet:
+            tm = ET.SubElement(note_el, 'time-modification')
+            ET.SubElement(tm, 'actual-notes').text = '3'
+            ET.SubElement(tm, 'normal-notes').text = '2'
         # Apply technique override if provided (marks this note as a stop)
         if tech_overrides and ev.string in tech_overrides:
             import copy
@@ -187,6 +245,13 @@ def _beat_to_xml_notes(
             _add_technical(note_el, ev_copy)
         else:
             _add_technical(note_el, ev)
+        # Tuplet notation — only on the first note of the chord group
+        if is_triplet and tuplet_type is not None and idx == 0:
+            notations = note_el.find('notations')
+            if notations is not None:
+                tup = ET.SubElement(notations, 'tuplet')
+                tup.set('type', tuplet_type)
+                tup.set('number', '1')
         if ev.tied:
             tie_el = ET.Element('tie')
             tie_el.set('type', 'start')
@@ -237,24 +302,29 @@ def _make_dest_note(
 # ---------------------------------------------------------------------------
 
 def _build_measure(
-    meas_num     : int,
-    em           : ExpandedMeasure,
-    mt           : MeasureTiming,
-    tuning       : list[int],
-    stem         : str,
-    title        : str,
-    composer     : str,
-    first_meas   : bool = False,
-    prev_time_sig: tuple[int, int] | None = None,
-    meta_time_sig: tuple[int, int] | None = None,
+    meas_num          : int,
+    em                : ExpandedMeasure,
+    mt                : MeasureTiming,
+    tuning            : list[int],
+    stem              : str,
+    title             : str,
+    composer          : str,
+    first_meas        : bool = False,
+    prev_time_sig     : tuple[int, int] | None = None,
+    meta_time_sig     : tuple[int, int] | None = None,
+    effective_divisions: int | None = None,
 ) -> ET.Element:
     """Build one <measure> element from an ExpandedMeasure + MeasureTiming.
 
-    prev_time_sig : (num, denom) from the preceding measure, or None on the first.
-    meta_time_sig : (num, denom) from the tab header, used to override the MIDI
-                    time signature on the first measure (MIDI often defaults to
-                    4/4 even when the piece is in 2/4, 3/4, etc.).
+    prev_time_sig      : (num, denom) from the preceding measure, or None on first.
+    meta_time_sig      : (num, denom) from the tab header, used to override the MIDI
+                         time signature on the first measure.
+    effective_divisions: ticks per quarter note to write into <divisions>; defaults
+                         to mt.divisions.  Pass TAB_DIVISIONS (384) for pieces with
+                         tab-encoded note durations.
     """
+    eff_div = effective_divisions if effective_divisions is not None else mt.divisions
+
     # Determine effective time signature for this measure.
     # On the first measure: prefer the tab header's explicit time sig over the
     # MIDI's (which may default to 4/4 regardless of the actual metre).
@@ -279,7 +349,7 @@ def _build_measure(
     if first_meas or ts_changed:
         attrs = ET.SubElement(meas_el, 'attributes')
         if first_meas:
-            ET.SubElement(attrs, 'divisions').text = str(mt.divisions)
+            ET.SubElement(attrs, 'divisions').text = str(eff_div)
             key_el = ET.SubElement(attrs, 'key')
             ET.SubElement(key_el, 'fifths').text = '0'   # updated from metadata
         time_el = ET.SubElement(attrs, 'time')
@@ -300,7 +370,11 @@ def _build_measure(
 
     # ── Beat groups ──────────────────────────────────────────────────────────
     tab_beats  = get_beats(em.notes)
-    midi_beats = mt.beat_groups
+    # Filter phantom MIDI beats: very short events (< 10 ticks at any division)
+    # arise from note-on artifacts in arpeggiated MIDI performances and cause
+    # mis-alignment when zipped with tab beat groups.  Strip them before pairing.
+    _PHANTOM_TICKS = 10
+    midi_beats = [bg for bg in mt.beat_groups if bg.duration_ticks >= _PHANTOM_TICKS]
 
     n_tab  = len(tab_beats)
     n_midi = len(midi_beats)
@@ -328,24 +402,35 @@ def _build_measure(
         # MIDI beat's pitches include the slide destination, merge both MIDI
         # durations into the slide beat and advance the MIDI index by 2.
 
-        durations: list[int] = []
+        # ── Phase 1: determine duration + type for every tab beat ────────────
+        # When a beat's notes carry tab_duration (from a duration-row format
+        # file), use that directly.  Otherwise fall back to MIDI beat groups.
+        # beat_info entries: (ticks, note_type, dots, is_triplet)
+        beat_info: list[tuple[int, str, int, bool]] = []
+        durations: list[int] = []   # kept for synth/slide splitting below
         midi_idx = 0
         estimation_count = 0
+        # Scale mt.total_ticks to eff_div units for estimation fallback
+        if mt.divisions > 0 and eff_div != mt.divisions:
+            total_ticks_scaled = mt.total_ticks * eff_div // mt.divisions
+        else:
+            total_ticks_scaled = mt.total_ticks
 
         for tb in tab_beats:
+            # Use MIDI timing (tab_duration is metadata only, not used for timing)
             if midi_idx >= n_midi:
-                # No more MIDI beats: estimate from remaining measure ticks
                 used = sum(durations)
-                remaining = max(1, mt.total_ticks - used)
+                remaining = max(1, total_ticks_scaled - used)
                 left = n_tab - len(durations)
-                durations.append(max(1, remaining // max(1, left)))
+                est = max(1, remaining // max(1, left))
+                beat_info.append((est, 'quarter', 0, False))
+                durations.append(est)
                 estimation_count += 1
                 continue
 
             dur = midi_beats[midi_idx].duration_ticks
 
-            # Slide detection: does this tab beat have a slide with a known
-            # destination, and does the next MIDI beat contain that pitch?
+            # Slide detection: merge MIDI transit + arrival durations
             slide_ev = next(
                 (ev for ev in tb
                  if ev.technique in ('slide_up', 'slide_down')
@@ -356,10 +441,11 @@ def _build_measure(
                 dest_pitch = tuning[slide_ev.string - 1] + slide_ev.slide_to
                 next_pitches = midi_beats[midi_idx + 1].midi_pitches
                 if any(abs(p - dest_pitch) <= 1 for p in next_pitches):
-                    # Merge: slide transit + slide arrival = full slide duration
                     dur += midi_beats[midi_idx + 1].duration_ticks
-                    midi_idx += 1   # consume the destination beat
+                    midi_idx += 1
 
+            _, nt, dots = ticks_to_duration(dur, eff_div, mt.time_sig_denom)
+            beat_info.append((dur, nt, dots, False))
             durations.append(dur)
             midi_idx += 1
 
@@ -375,11 +461,22 @@ def _build_measure(
                 ),
             )
 
+        # ── Phase 2: compute tuplet start/stop markers ────────────────────────
+        # Every run of 3 consecutive triplet beats forms one tuplet group.
+        tuplet_types: list[Optional[str]] = [None] * len(beat_info)
+        triplet_count = 0
+        for i, (_, _, _, is_tri) in enumerate(beat_info):
+            if is_tri:
+                triplet_count += 1
+                if triplet_count == 1:
+                    tuplet_types[i] = 'start'
+                elif triplet_count == 3:
+                    tuplet_types[i] = 'stop'
+                    triplet_count = 0
+            else:
+                triplet_count = 0
+
         # ── Pre-pass: identify technique stop destinations ────────────────────
-        # Maps (beat_idx, string) → stop_technique for notes in the NEXT beat
-        # that are explicit slide destinations already present in the tab.
-        # Also collects (beat_idx, string) pairs that have implicit destinations
-        # (pull-offs, hammer-ons, and slides with no matching next-beat note).
         _STOP_MAP = {
             'slide_up': 'slide_stop', 'slide_down': 'slide_stop',
             'hammer': 'hammer_stop', 'pull': 'pull_stop',
@@ -392,18 +489,17 @@ def _build_measure(
                 if ev.technique not in _STOP_MAP or ev.slide_to is None:
                     continue
                 stop = _STOP_MAP[ev.technique]
-                # Slides: look for explicit destination in the immediately next beat
                 if ev.technique in ('slide_up', 'slide_down') and bi + 1 < len(tab_beats):
                     for nev in tab_beats[bi + 1]:
                         if nev.string == ev.string and nev.fret == ev.slide_to:
                             explicit_stops[(bi + 1, ev.string)] = stop
                             has_explicit.add((bi, ev.string))
                             break
-                # pull / hammer: destination was consumed by parser; always implicit
 
         # ── Emit notes ───────────────────────────────────────────────────────
         for bi, (tb, dur) in enumerate(zip(tab_beats, durations)):
-            _, note_type, dots = ticks_to_duration(dur, mt.divisions, mt.time_sig_denom)
+            _, note_type, dots, is_triplet = beat_info[bi]
+            tuplet_type = tuplet_types[bi]
 
             # Collect stop overrides for notes in THIS beat
             stop_overrides: dict[int, str] = {
@@ -413,27 +509,27 @@ def _build_measure(
             }
 
             # Collect technique sources needing synthesized destinations
-            synth: list[tuple[NoteEvent, int, str]] = []   # (src_ev, dest_fret, stop_tech)
+            synth: list[tuple[NoteEvent, int, str]] = []
             for ev in tb:
                 if ev.technique not in _STOP_MAP or ev.slide_to is None:
                     continue
                 if (bi, ev.string) in has_explicit:
-                    continue  # explicit destination handled above
+                    continue
                 synth.append((ev, ev.slide_to, _STOP_MAP[ev.technique]))
 
             if synth:
-                # Split duration: source gets 2/3, destination gets 1/3
                 src_dur = max(1, dur * 2 // 3)
                 dst_dur = max(1, dur - src_dur)
-                _, src_type, src_dots = ticks_to_duration(src_dur, mt.divisions, mt.time_sig_denom)
-                _, dst_type, dst_dots = ticks_to_duration(dst_dur, mt.divisions, mt.time_sig_denom)
+                _, src_type, src_dots = ticks_to_duration(src_dur, eff_div, mt.time_sig_denom)
+                _, dst_type, dst_dots = ticks_to_duration(dst_dur, eff_div, mt.time_sig_denom)
 
-                # Emit source beat (with start annotations)
-                for ne in _beat_to_xml_notes(tb, src_dur, src_type, src_dots, mt.divisions, tuning, tech_overrides=stop_overrides):
+                for ne in _beat_to_xml_notes(
+                    tb, src_dur, src_type, src_dots, eff_div, tuning,
+                    tech_overrides=stop_overrides,
+                    is_triplet=is_triplet, tuplet_type=tuplet_type,
+                ):
                     meas_el.append(ne)
 
-                # Emit synthesized destination notes (not chord relative to each other
-                # only if there are multiple synth sources; first is always non-chord)
                 for idx, (src_ev, dest_fret, stop_tech) in enumerate(synth):
                     dn = _make_dest_note(
                         src_ev, dest_fret, stop_tech,
@@ -442,8 +538,11 @@ def _build_measure(
                     )
                     meas_el.append(dn)
             else:
-                # Normal beat (possibly with stop overrides for explicit destinations)
-                for ne in _beat_to_xml_notes(tb, dur, note_type, dots, mt.divisions, tuning, tech_overrides=stop_overrides):
+                for ne in _beat_to_xml_notes(
+                    tb, dur, note_type, dots, eff_div, tuning,
+                    tech_overrides=stop_overrides,
+                    is_triplet=is_triplet, tuplet_type=tuplet_type,
+                ):
                     meas_el.append(ne)
 
     # ── Closing repeat barline ───────────────────────────────────────────────
@@ -527,6 +626,12 @@ def build_musicxml(
 
     n_pairs = min(n_exp, n_midi)
 
+    # Effective divisions = MIDI divisions (MIDI is the timing oracle).
+    # tab_duration field on NoteEvent is stored as metadata but not used for
+    # timing here — MIDI beat groups (with phantom-beat filtering) provide the
+    # actual durations.
+    eff_div = timing.measures[0].divisions if timing.measures else 480
+
     # ── Score skeleton ───────────────────────────────────────────────────────
     root = ET.Element('score-partwise')
     root.set('version', '3.1')
@@ -572,16 +677,17 @@ def build_musicxml(
         em = expanded.measures[i]
         mt = timing.measures[i]
         meas_el = _build_measure(
-            meas_num      = i + 1,
-            em            = em,
-            mt            = mt,
-            tuning        = tuning,
-            stem          = stem,
-            title         = title,
-            composer      = composer,
-            first_meas    = (i == 0),
-            prev_time_sig = prev_time_sig,
-            meta_time_sig = meta_time_sig if i == 0 else None,
+            meas_num           = i + 1,
+            em                 = em,
+            mt                 = mt,
+            tuning             = tuning,
+            stem               = stem,
+            title              = title,
+            composer           = composer,
+            first_meas         = (i == 0),
+            prev_time_sig      = prev_time_sig,
+            meta_time_sig      = meta_time_sig if i == 0 else None,
+            effective_divisions = eff_div,
         )
         # Track the effective time sig for this measure so the next measure
         # can detect changes.  Use the meta override for the first measure.
@@ -618,14 +724,15 @@ def build_musicxml(
             em = expanded.measures[i]
             fallback_ts = (fallback_mt.time_sig_num, fallback_mt.time_sig_denom)
             meas_el = _build_measure(
-                meas_num      = i + 1,
-                em            = em,
-                mt            = fallback_mt,
-                tuning        = tuning,
-                stem          = stem,
-                title         = title,
-                composer      = composer,
-                prev_time_sig = prev_time_sig,
+                meas_num            = i + 1,
+                em                  = em,
+                mt                  = fallback_mt,
+                tuning              = tuning,
+                stem                = stem,
+                title               = title,
+                composer            = composer,
+                prev_time_sig       = prev_time_sig,
+                effective_divisions = eff_div,
             )
             prev_time_sig = fallback_ts
             part.append(meas_el)

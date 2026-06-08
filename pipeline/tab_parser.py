@@ -130,6 +130,52 @@ _HAS_PIMA = re.compile(r'[pima]', re.IGNORECASE)
 _FINGER_RE = re.compile(r'^[\d\s]+$')
 _TRIPLET_RE = re.compile(r'-3-')
 
+# Duration-row format (e.g. "1  E. S E E"):  a bar number followed by H/Q/E/S
+_DUR_ROW_RE = re.compile(r'^\d{1,2}\s+[HQES]')
+
+
+def _parse_dur_row(line: str) -> dict[int, str]:
+    """
+    Parse a duration-row line (e.g. '1  E. S E E   E. S E  E ...').
+
+    Returns {col: dur_str} where col is the column of the H/Q/E/S character in
+    *line* and dur_str is the code including any trailing '.' (dotted) or '+'
+    (tied), e.g. 'E', 'E.', 'Q', 'S+'.
+
+    Triplet-bracket annotations (|3-|, |3|, |-3-|) that may appear inside the
+    duration row are skipped; they are handled separately via _parse_triplet_spans.
+    """
+    result: dict[int, str] = {}
+    i = 0
+    # Skip leading bar-number digits
+    while i < len(line) and line[i].isdigit():
+        i += 1
+    while i < len(line):
+        ch = line[i]
+        if ch in 'HQES':
+            col = i
+            dur = ch
+            i += 1
+            while i < len(line) and line[i] in '.+':
+                dur += line[i]
+                i += 1
+            result[col] = dur
+        elif ch == '|':
+            # Skip inline triplet markers |3-|, |3|, |-3-|
+            j = line.find('|', i + 1)
+            i = (j + 1) if j >= 0 else (i + 1)
+        else:
+            i += 1
+    return result
+
+
+def _parse_triplet_spans(line: str) -> list[tuple[int, int]]:
+    """
+    Return (start_col, end_col) pairs for each |3|/|3-|/|-3-| marker in *line*.
+    A duration-code column that falls within one of these spans is part of a triplet.
+    """
+    return [(m.start(), m.end()) for m in re.finditer(r'\|[-]?3[-]?\|', line)]
+
 
 # ---------------------------------------------------------------------------
 # System detection
@@ -161,9 +207,11 @@ def find_systems(lines: list[str]) -> list[dict]:
                 continue
 
             if len(string_idxs) == 6:
-                mnum_idx  = None
-                barre_idx = None
-                pima_idx  = None
+                mnum_idx       = None
+                barre_idx      = None
+                pima_idx       = None
+                dur_row_idx    = None
+                triplet_row_idx = None
 
                 for k in range(i - 1, max(i - 6, -1), -1):
                     ln = lines[k]
@@ -171,6 +219,25 @@ def find_systems(lines: list[str]) -> list[dict]:
                         break
                     if _MNUM_STRICT_RE.match(ln):
                         mnum_idx = k
+                        break
+                    if _DUR_ROW_RE.match(ln):
+                        # Duration-row format: bar number + H/Q/E/S codes.
+                        # Treat it as the measure-number line too.
+                        mnum_idx    = k
+                        dur_row_idx = k
+                        # The line immediately above the duration row may carry
+                        # triplet-bracket annotations (|3-|, |3|, |-3-|) and/or a
+                        # bare time signature.  Record it for triplet detection.
+                        # NOTE: lines like "   |3|   |3-|" are falsely matched by
+                        # _STRING_LINE_RE (pattern D: \s*\|[-0-9]) because |3| starts
+                        # with | followed by a digit.  Check for triplet markers first.
+                        if k > 0:
+                            above = lines[k - 1]
+                            has_triplets = bool(
+                                re.search(r'\|[-]?3[-]?\|', above)
+                            )
+                            if has_triplets or not _STRING_LINE_RE.match(above):
+                                triplet_row_idx = k - 1
                         break
                     if _BARRE_RE.search(ln) and barre_idx is None:
                         barre_idx = k
@@ -193,11 +260,13 @@ def find_systems(lines: list[str]) -> list[dict]:
                         break
 
                 systems.append({
-                    'mnum_idx':    mnum_idx,
-                    'barre_idx':   barre_idx,
-                    'pima_idx':    pima_idx,
-                    'string_idxs': string_idxs,
-                    'finger_idxs': finger_idxs,
+                    'mnum_idx':       mnum_idx,
+                    'barre_idx':      barre_idx,
+                    'pima_idx':       pima_idx,
+                    'string_idxs':    string_idxs,
+                    'finger_idxs':    finger_idxs,
+                    'dur_row_idx':    dur_row_idx,
+                    'triplet_row_idx': triplet_row_idx,
                 })
                 i = j
                 continue
@@ -658,17 +727,36 @@ def parse_tab(lines: list[str], tuning_str: str = "EADGBE") -> dict[int, Measure
     has_repeat_start = False
 
     for sys in systems:
-        mnum_idx    = sys['mnum_idx']
-        barre_idx   = sys['barre_idx']
-        pima_idx    = sys['pima_idx']
-        string_idxs = sys['string_idxs']
-        finger_idxs = sys['finger_idxs']
+        mnum_idx        = sys['mnum_idx']
+        barre_idx       = sys['barre_idx']
+        pima_idx        = sys['pima_idx']
+        string_idxs     = sys['string_idxs']
+        finger_idxs     = sys['finger_idxs']
+        dur_row_idx     = sys.get('dur_row_idx')
+        triplet_row_idx = sys.get('triplet_row_idx')
 
         string_lines = [lines[i] for i in string_idxs]
         finger_lines = [lines[i] for i in finger_idxs]
         mnum_line    = lines[mnum_idx] if mnum_idx is not None else None
         barre_line   = lines[barre_idx] if barre_idx is not None else None
         pima_line    = lines[pima_idx]  if pima_idx  is not None else None
+
+        # ── Duration-row support ─────────────────────────────────────────────
+        # Build a {col: dur_str} map for the whole system.  dur_str is the raw
+        # code ('E', 'E.', 'Q', etc.) prefixed with '3' if the column falls
+        # within a triplet-bracket span (e.g. '3E' for a triplet eighth).
+        dur_map: dict[int, str] = {}
+        if dur_row_idx is not None:
+            raw_durs = _parse_dur_row(lines[dur_row_idx])
+            triplet_spans: list[tuple[int, int]] = []
+            if triplet_row_idx is not None:
+                triplet_spans = _parse_triplet_spans(lines[triplet_row_idx])
+            # Also check the duration row itself for inline triplet markers
+            # (some files put |3-| on the same line as the duration codes).
+            triplet_spans += _parse_triplet_spans(lines[dur_row_idx])
+            for col, dur in raw_durs.items():
+                is_tri = any(ts <= col <= te for ts, te in triplet_spans)
+                dur_map[col] = ('3' + dur if is_tri else dur)
 
         # Collect all annotation lines above the string block (non-string, non-empty)
         # that may carry 'Harm.' / '(Harm)' / 'nat.harm.' text.
@@ -741,6 +829,29 @@ def parse_tab(lines: list[str], tuning_str: str = "EADGBE") -> dict[int, Measure
                         for hs, he in harm_spans
                     ):
                         note.harmonic = True
+
+            # ── Assign tab_duration to notes from the duration row ───────────
+            # Each note gets the duration code whose column is closest to the
+            # note's column, within the current measure cell's column range.
+            # Notes that share a column (simultaneous chord) all receive the
+            # same duration code.
+            if dur_map:
+                # Gather duration codes that fall inside this measure's columns
+                cell_durs = {
+                    c: d for c, d in dur_map.items()
+                    if col_start <= c <= col_end
+                }
+                if cell_durs:
+                    # For each unique beat column, find the closest duration code
+                    beat_cols = sorted(set(n.col for n in all_notes))
+                    beat_to_dur: dict[int, str] = {}
+                    for bc in beat_cols:
+                        closest_col = min(cell_durs, key=lambda c: abs(c - bc))
+                        if abs(closest_col - bc) <= 6:  # 6-column tolerance
+                            beat_to_dur[bc] = cell_durs[closest_col]
+                    for note in all_notes:
+                        if note.col in beat_to_dur:
+                            note.tab_duration = beat_to_dur[note.col]
 
             md.notes.extend(all_notes)
 

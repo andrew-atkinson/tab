@@ -24,6 +24,7 @@ class NoteEvent:
     midi_pitch: int = -1     # sounding MIDI pitch (-1 = unknown)
     slide_to: Optional[int] = None    # destination fret for slides, e.g. 1/5 → slide_to=5
     touch_fret: Optional[int] = None  # artificial harmonic: fret to touch (e.g. 3[15] → touch_fret=15)
+    tab_duration: str = ""            # duration from duration row, e.g. "E.", "Q", "3E" (triplet), "S+"
 
 
 @dataclass
