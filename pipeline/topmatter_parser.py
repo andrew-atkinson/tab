@@ -75,7 +75,7 @@ _TUNING_RE = re.compile(
     re.IGNORECASE
 )
 _TUNE_6_RE = re.compile(
-    r'tune\s+(?:the\s+)?(?:6(?:th)?|sixth)\s+string\s+to\s+([A-Ga-g][#b]?)',
+    r'(?:6(?:th)?|sixth)\s+string\s+tun(?:e|ed)\s+to\s+([A-Ga-g][#b]?)',
     re.IGNORECASE
 )
 _TUNE_1_RE = re.compile(
@@ -415,6 +415,8 @@ def find_chords_fingering(lines: list[str]) -> list[dict]:
 
 _KEY_RE   = re.compile(r'key(?:\s*sig(?:nature)?)?\s*[:\-–]?\s+([^\n,\t\d]{1,20}?)(?:\s{2,}|\t|\n|$)', re.IGNORECASE | re.MULTILINE)
 _TIME_RE  = re.compile(r'time(?:\s*sig(?:nature)?)?\s*(?:is\s*|[:\-–]\s*)?(\d+/\d+)', re.IGNORECASE | re.MULTILINE)
+# Matches a bare time signature like "  2/4" or "3/8" on its own line (no "time" keyword)
+_BARE_TS_RE = re.compile(r'^\s*(\d{1,2}/(?:2|4|8|16))\b')
 _TEMPO_RE = re.compile(r'tempo\s*[:\-–]?\s+(\d+)\s*(?:bpm)?(?:\s*[-–]\s*(\d+)\s*(?:bpm)?)?(?:\s*\(([^)]+)\))?', re.IGNORECASE | re.MULTILINE)
 _CAPO_RE  = re.compile(r'capo\s*[:\-–]?\s*(\d+)', re.IGNORECASE)
 
@@ -453,6 +455,16 @@ def parse_topmatter(lines: list[str]) -> dict:
     m = _TIME_RE.search(header)
     if m:
         time_sig = m.group(1)
+
+    # Fallback: bare time signature on its own line (e.g. "  2/4  |3-|")
+    # This occurs in files that declare the metre above the first tab system
+    # without the usual "time sig:" label.
+    if not time_sig:
+        for line in lines[:20]:
+            bm = _BARE_TS_RE.match(line)
+            if bm:
+                time_sig = bm.group(1)
+                break
 
     return {
         'title':          cat['title'],
